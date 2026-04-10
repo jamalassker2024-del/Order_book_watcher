@@ -9,7 +9,7 @@ import time
 # --- PRODUCTION CONFIGURATION ---
 CONFIG = {
     "SYMBOL": "PEPEUSDT",         
-    "TRADE_SIZE_USD": Decimal("1.00"), 
+    "TRADE_SIZE_USD": Decimal("5.00"), 
     "BASE_IMBALANCE_THRESH": Decimal("0.10"), # LOWERED for more action
     "DEPTH": 20,                               
     "POLL_SPEED": 1.0, # Slowed slightly to prevent API rate limits                        
@@ -26,7 +26,7 @@ logger = logging.getLogger("WeightWatcher-PRO")
 
 class WeightWatcherPRO:
     def __init__(self):
-        self.shadow_balance = Decimal("3.00")
+        self.shadow_balance = Decimal("30.00")
         self.news_multiplier = Decimal("1.0")
         self.imbalance_history = []
         self.start_time = time.time()
