@@ -1,20 +1,16 @@
 import asyncio
 import logging
-import aiohttp
+import requests
 import feedparser
-import time
 from decimal import Decimal
 
-# --- REAL-WORLD CONFIGURATION ---
+# --- CONFIGURATION ---
 CONFIG = {
-    "SYMBOL": "BTCUSDT",
-    "TRADE_SIZE": Decimal("1.00"),    # USD size
-    "BASE_IMB_THRESH": Decimal("0.35"),# 35% Weight difference
-    "DEPTH": 20,
-    "POLL_SPEED": 0.3,                 # 300ms for faster reaction
-    "TP": Decimal("0.0050"),           # 0.50% Actual Move (Realistic for scalping)
-    "SL": Decimal("0.0025"),           # 0.25% Stop Loss
-    "FEE": Decimal("0.001"),           # 0.1% Binance Fee
+    "BINANCE_SYMBOL": "BTCUSDT",
+    "TRADE_SIZE_USD": Decimal("0.40"),
+    "BASE_IMBALANCE_THRESH": Decimal("0.30"), # 30% weight difference
+    "DEPTH": 20,                               # Depth of order book to scan
+    "POLL_SPEED": 0.5,                         # Speed of price/book checks
     "NEWS_FEEDS": [
         "https://cointelegraph.com/rss",
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -23,111 +19,78 @@ CONFIG = {
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-log = logging.getLogger("V25-SENTINEL")
+logger = logging.getLogger("WeightWatcher-Master")
 
-class WeightWatcherSentinel:
+class WeightWatcherMaster:
     def __init__(self):
-        self.balance = Decimal("10.00")
+        self.shadow_balance = Decimal("3.00")
         self.news_multiplier = Decimal("1.0")
         self.hot_keywords = ["BREAKING", "CRASH", "SEC", "LIQUIDATION", "PUMP", "SURGE", "ETF"]
-        self.last_news_check = 0
 
-    # --- NEWS SCANNER (Sensitivity Booster) ---
-    async def scan_news(self, session):
+    # --- TASK 1: NEWS SCANNER (Sensitivity Booster) ---
+    async def scan_news(self):
+        """Scans RSS feeds and lowers the threshold if news is hot"""
         while True:
             try:
                 found_heat = False
                 for url in CONFIG["NEWS_FEEDS"]:
-                    async with session.get(url, timeout=5) as resp:
-                        content = await resp.text()
-                        feed = feedparser.parse(content)
-                        for entry in feed.entries[:5]:
-                            if any(word in entry.title.upper() for word in self.hot_keywords):
-                                found_heat = True
-                                break
+                    feed = feedparser.parse(url)
+                    for entry in feed.entries[:3]:
+                        if any(word in entry.title.upper() for word in self.hot_keywords):
+                            found_heat = True
+                            break
                 
-                self.news_multiplier = Decimal("0.6") if found_heat else Decimal("1.0")
+                # If news is hot, we trade on much smaller imbalances (Multiplier 0.5x reduces threshold)
+                self.news_multiplier = Decimal("0.5") if found_heat else Decimal("1.0")
                 if found_heat:
-                    log.info("📡 NEWS ALERT: Market Heat Detected. Lowering Entry Bar.")
-            except Exception as e:
-                log.debug(f"News fetch error: {e}")
+                    logger.info("📡 NEWS ALERT: High Volatility Expected. Increasing Sensitivity.")
+            except:
+                pass
             await asyncio.sleep(60)
 
-    # --- ORDER BOOK & PRICE ENGINE ---
-    async def get_market_data(self, session):
+    # --- TASK 2: ORDER BOOK ANALYSIS ---
+    async def get_imbalance(self):
         try:
-            url = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['SYMBOL']}&limit={CONFIG['DEPTH']}"
-            async with session.get(url, timeout=1) as resp:
-                res = await resp.json()
-                
-                # Best Bid/Ask for Mid Price
-                bid_price = Decimal(res['bids'][0][0])
-                ask_price = Decimal(res['asks'][0][0])
-                mid_price = (bid_price + ask_price) / 2
-                
-                # Weight calculation
-                bid_weight = sum(Decimal(b[0]) * Decimal(b[1]) for b in res['bids'])
-                ask_weight = sum(Decimal(a[0]) * Decimal(a[1]) for a in res['asks'])
-                
-                imbalance = (bid_weight - ask_weight) / (bid_weight + ask_weight)
-                return imbalance, mid_price
+            url = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['BINANCE_SYMBOL']}&limit={CONFIG['DEPTH']}"
+            res = requests.get(url, timeout=1).json()
+            
+            # Calculate Weight (Price * Quantity)
+            bid_weight = sum(Decimal(b[0]) * Decimal(b[1]) for b in res['bids'])
+            ask_weight = sum(Decimal(a[0]) * Decimal(a[1]) for a in res['asks'])
+            
+            imbalance = (bid_weight - ask_weight) / (bid_weight + ask_weight)
+            return imbalance
         except:
-            return None, None
+            return Decimal("0")
 
     async def run(self):
-        log.info(f"⚖️ V25 SENTINEL ONLINE | Live Conditions Enabled | Bal: ${self.balance}")
+        logger.info(f"⚖️ V14.2 MASTER DEMO ONLINE | Balance: ${self.shadow_balance}")
+        asyncio.create_task(self.scan_news())
         
-        async with aiohttp.ClientSession() as session:
-            # Start News Task
-            asyncio.create_task(self.scan_news(session))
+        while True:
+            imbalance = await self.get_imbalance()
             
-            while True:
-                imb, price = await self.get_market_data(session)
-                if imb is None: continue
-                
-                dynamic_thresh = CONFIG["BASE_IMB_THRESH"] * self.news_multiplier
-                
-                direction = None
-                if imb > dynamic_thresh: direction = "BUY"
-                elif imb < -dynamic_thresh: direction = "SELL"
-                
-                if direction:
-                    entry_price = price
-                    log.info(f"🚀 ENTRY {direction} @ {entry_price} | Imb: {round(imb,3)}")
-                    
-                    # --- LIVE POSITION TRACKING ---
-                    start_time = time.time()
-                    while True:
-                        _, current_price = await self.get_market_data(session)
-                        if current_price is None: continue
-                        
-                        # Calculate Profit/Loss based on direction
-                        if direction == "BUY":
-                            move = (current_price - entry_price) / entry_price
-                        else:
-                            move = (entry_price - current_price) / entry_price
-                            
-                        # Exit Checks
-                        if move >= CONFIG["TP"]:
-                            net_pnl = CONFIG["TRADE_SIZE"] * (move - (CONFIG["FEE"] * 2))
-                            self.balance += net_pnl
-                            log.info(f"✅ TAKE PROFIT | Move: {round(move*100,2)}% | Net: ${round(net_pnl,4)} | Bal: ${round(self.balance,3)}")
-                            break
-                        
-                        if move <= -CONFIG["SL"]:
-                            net_pnl = CONFIG["TRADE_SIZE"] * (move - (CONFIG["FEE"] * 2))
-                            self.balance += net_pnl
-                            log.info(f"❌ STOP LOSS | Move: {round(move*100,2)}% | Net: ${round(net_pnl,4)} | Bal: ${round(self.balance,3)}")
-                            break
-                            
-                        # Safety Timeout (10 minutes)
-                        if time.time() - start_time > 600:
-                            log.info("⌛ Trade Timed Out. Exiting at Mid-Market.")
-                            break
-                            
-                        await asyncio.sleep(0.3)
+            # Apply News Multiplier to the Threshold
+            # Example: 0.30 threshold * 0.5 (Hot News) = 0.15 threshold
+            dynamic_threshold = CONFIG["BASE_IMBALANCE_THRESH"] * self.news_multiplier
+            
+            # --- BUY LOGIC ---
+            if imbalance > dynamic_threshold:
+                profit = CONFIG["TRADE_SIZE_USD"] * Decimal("0.018") # 1.8% simulated scalp
+                self.shadow_balance += profit
+                logger.info(f"🎯 IMBALANCE BUY! Weight: {round(imbalance,3)} | News-Boost: {self.news_multiplier != 1.0}")
+                logger.info(f"💰 Shadow Balance: ${round(self.shadow_balance, 3)}")
+                await asyncio.sleep(4) # Simulate trade lock time
 
-                await asyncio.sleep(CONFIG["POLL_SPEED"])
+            # --- SELL LOGIC ---
+            elif imbalance < -dynamic_threshold:
+                profit = CONFIG["TRADE_SIZE_USD"] * Decimal("0.018")
+                self.shadow_balance += profit
+                logger.info(f"🎯 IMBALANCE SELL! Weight: {round(imbalance,3)} | News-Boost: {self.news_multiplier != 1.0}")
+                logger.info(f"💰 Shadow Balance: ${round(self.shadow_balance, 3)}")
+                await asyncio.sleep(4)
+
+            await asyncio.sleep(CONFIG["POLL_SPEED"])
 
 if __name__ == "__main__":
-    asyncio.run(WeightWatcherSentinel().run())
+    asyncio.run(WeightWatcherMaster().run())
