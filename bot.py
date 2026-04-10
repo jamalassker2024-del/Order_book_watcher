@@ -1,89 +1,128 @@
 import asyncio
+import aiohttp
 import logging
-import requests
-from decimal import Decimal
 import time
+from decimal import Decimal
+from collections import deque
 
-# --- AGGRESSIVE WINNER CONFIG ---
 CONFIG = {
     "SYMBOL": "PEPEUSDT",
-    "TRADE_SIZE_USD": Decimal("1.00"),
-    "IMBALANCE_THRESH": Decimal("0.18"), # Lowered for more action
-    "FEE_RATE": Decimal("0.001"),        # 0.1% Binance Fee
-    "POLL_SPEED": 0.5,                   # High speed
-    "TAKE_PROFIT": Decimal("0.005"),     # 0.5% Target (Covers fees + profit)
+    "TRADE_SIZE_USD": Decimal("1.0"),
+
+    "IMB_THRESHOLD": Decimal("0.12"),   # lower = more trades
+    "MAX_TRADES": 5,                    # allow multiple trades
+    "COOLDOWN": 1.5,                    # seconds between entries
+
+    "FEE": Decimal("0.001"),
+    "BASE_TP": Decimal("0.004"),        # 0.4%
+    "BASE_SL": Decimal("-0.004"),       # -0.4%
+
+    "POLL": 0.3
 }
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger("WinnerBot")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+log = logging.getLogger("SCALPER")
 
-class AggressiveWinner:
+class Trade:
+    def __init__(self, side, entry):
+        self.side = side
+        self.entry = entry
+        self.open_time = time.time()
+
+class ScalperBot:
     def __init__(self):
-        self.shadow_balance = Decimal("30.00")
-        self.last_imb = Decimal("0")
+        self.balance = Decimal("30")
+        self.trades = []
+        self.last_entry_time = 0
 
-    async def get_market(self):
+        self.imb_history = deque(maxlen=10)
+
+    async def fetch(self, session):
         try:
-            # Combined call for speed
-            price_url = f"https://api.binance.com/api/v3/ticker/bookTicker?symbol={CONFIG['SYMBOL']}"
-            depth_url = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['SYMBOL']}&limit=5"
-            
-            p_res = requests.get(price_url, timeout=1).json()
-            d_res = requests.get(depth_url, timeout=1).json()
+            url1 = f"https://api.binance.com/api/v3/ticker/bookTicker?symbol={CONFIG['SYMBOL']}"
+            url2 = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['SYMBOL']}&limit=5"
 
-            bid_w = sum(Decimal(b[0]) * Decimal(b[1]) for b in d_res['bids'])
-            ask_w = sum(Decimal(a[0]) * Decimal(a[1]) for a in d_res['asks'])
+            async with session.get(url1) as r1, session.get(url2) as r2:
+                p = await r1.json()
+                d = await r2.json()
+
+            bid = Decimal(p['bidPrice'])
+            ask = Decimal(p['askPrice'])
+
+            bid_w = sum(Decimal(b[0]) * Decimal(b[1]) for b in d['bids'])
+            ask_w = sum(Decimal(a[0]) * Decimal(a[1]) for a in d['asks'])
+
             imb = (bid_w - ask_w) / (bid_w + ask_w)
 
-            return {"imb": imb, "ask": Decimal(p_res['askPrice']), "bid": Decimal(p_res['bidPrice'])}
-        except: return None
+            return bid, ask, imb
+        except:
+            return None
+
+    def smooth_imbalance(self, imb):
+        self.imb_history.append(imb)
+        return sum(self.imb_history) / len(self.imb_history)
 
     async def run(self):
-        logger.info(f"⚡ AGGRESSIVE WINNER START | Target: {CONFIG['SYMBOL']}")
-        
-        while True:
-            data = await self.get_market()
-            if not data: continue
+        log.info("🚀 SCALPER STARTED")
 
-            imb = data["imb"]
-            # Visual Pulse in logs
-            if abs(imb) > 0.1:
-                logger.info(f"🔍 Monitoring Imbalance: {round(imb, 3)}")
+        async with aiohttp.ClientSession() as session:
+            while True:
+                data = await self.fetch(session)
+                if not data:
+                    await asyncio.sleep(CONFIG["POLL"])
+                    continue
 
-            # --- TRIGGER LOGIC ---
-            if abs(imb) > CONFIG["IMBALANCE_THRESH"]:
-                side = "BUY" if imb > 0 else "SELL"
-                entry_p = data["ask"] if side == "BUY" else data["bid"]
-                
-                logger.info(f"🚀 {side} ENTERED at {entry_p}")
-                
-                # --- AGGRESSIVE PROFIT TRACKING ---
-                # We wait up to 30 seconds for a "Winning Spike"
-                start_trade = time.time()
-                while time.time() - start_trade < 30:
-                    await asyncio.sleep(0.5)
-                    check = await self.get_market()
-                    if not check: continue
-                    
-                    current_exit = check["bid"] if side == "BUY" else check["ask"]
-                    move = (current_exit - entry_p) / entry_p if side == "BUY" else (entry_p - current_exit) / entry_p
-                    net = move - (CONFIG["FEE_RATE"] * 2)
+                bid, ask, imb = data
+                imb = self.smooth_imbalance(imb)
 
-                    # EXIT IF WE HIT PROFIT TARGET
-                    if net >= CONFIG["TAKE_PROFIT"]:
-                        self.shadow_balance += (CONFIG["TRADE_SIZE_USD"] * net)
-                        logger.info(f"💰 WINNER! Net: +{round(net*100, 3)}% | Bal: ${round(self.shadow_balance, 3)}")
-                        break
-                    
-                    # EMERGENCY EXIT (If it goes against us -0.5%)
-                    if net < Decimal("-0.005"):
-                        self.shadow_balance += (CONFIG["TRADE_SIZE_USD"] * net)
-                        logger.info(f"⚠️ STOP LOSS | Net: {round(net*100, 3)}% | Bal: ${round(self.shadow_balance, 3)}")
-                        break
-                
-                await asyncio.sleep(2) # Short cooldown
+                # 🔍 ENTRY LOGIC
+                now = time.time()
 
-            await asyncio.sleep(CONFIG["POLL_SPEED"])
+                if (
+                    abs(imb) > CONFIG["IMB_THRESHOLD"]
+                    and len(self.trades) < CONFIG["MAX_TRADES"]
+                    and now - self.last_entry_time > CONFIG["COOLDOWN"]
+                ):
+                    side = "BUY" if imb > 0 else "SELL"
+                    entry = ask if side == "BUY" else bid
+
+                    self.trades.append(Trade(side, entry))
+                    self.last_entry_time = now
+
+                    log.info(f"🚀 OPEN {side} @ {entry} | Active: {len(self.trades)}")
+
+                # 🔄 MANAGE TRADES
+                still_open = []
+
+                for t in self.trades:
+                    current = bid if t.side == "BUY" else ask
+
+                    move = (
+                        (current - t.entry) / t.entry
+                        if t.side == "BUY"
+                        else (t.entry - current) / t.entry
+                    )
+
+                    net = move - (CONFIG["FEE"] * 2)
+
+                    # dynamic TP/SL
+                    tp = CONFIG["BASE_TP"]
+                    sl = CONFIG["BASE_SL"]
+
+                    if net >= tp or net <= sl:
+                        pnl = CONFIG["TRADE_SIZE_USD"] * net
+                        self.balance += pnl
+
+                        log.info(
+                            f"{'💰 WIN' if net>0 else '❌ LOSS'} "
+                            f"{t.side} | {round(net*100,3)}% | Bal: {round(self.balance,2)}"
+                        )
+                    else:
+                        still_open.append(t)
+
+                self.trades = still_open
+
+                await asyncio.sleep(CONFIG["POLL"])
 
 if __name__ == "__main__":
-    asyncio.run(AggressiveWinner().run())
+    asyncio.run(ScalperBot().run())
