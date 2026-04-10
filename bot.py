@@ -1,26 +1,26 @@
-import asyncio, logging, aiohttp, time
+import asyncio, logging, aiohttp, time, math
 from decimal import Decimal
 from collections import deque
 
 CONFIG = {
     "SYMBOL": "BTCUSDT",
     "TRADE_SIZE": Decimal("2.0"),
-    "IMB_THRESHOLD": Decimal("0.75"), # 🎯 Lowered slightly for more opportunities
-    "VOL_MIN": Decimal("0.0004"),     # 📊 More sensitive to small breakouts
-    "TP": Decimal("0.0050"),          # ✅ 0.50% Target (Shoot for higher R:R)
-    "SL": Decimal("0.0025"),          # ❌ 0.25% Initial Stop Loss
+    "IMB_THRESHOLD": Decimal("0.80"), 
+    "VOL_MIN": Decimal("0.0008"),     # Higher bar for entry
+    "TP": Decimal("0.0060"),          # 0.60% (Bigger wins)
+    "SL": Decimal("0.0035"),          # 0.35% (Give it room to breathe)
     "FEE": Decimal("0.001"),          
-    "MAX_HOLD": 300,                  # ⌛ Increased to 5 mins (let trades breathe)
-    "POLL": 0.3,
+    "MAX_HOLD": 600,                  # 10 minutes (Patience is profit)
+    "POLL": 0.4,
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-log = logging.getLogger("V22-PREDATOR")
+log = logging.getLogger("V23-TERMINATOR")
 
-class SniperV22:
+class SniperV23:
     def __init__(self):
         self.balance = Decimal("77.69")
-        self.price_hist = deque(maxlen=30) 
+        self.price_hist = deque(maxlen=50) # Larger window for trend
         self.last_trade = 0
 
     async def fetch(self, session):
@@ -29,66 +29,65 @@ class SniperV22:
             async with session.get(url, timeout=1) as r:
                 d = await r.json()
                 bid, ask = Decimal(d['bids'][0][0]), Decimal(d['asks'][0][0])
-                bid_vol = sum(Decimal(x[1]) for x in d['bids'][:5]) # Top 5 levels only
-                ask_vol = sum(Decimal(x[1]) for x in d['asks'][:5])
-                imb = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-                return (bid + ask) / 2, imb
+                bid_v = sum(Decimal(x[1]) for x in d['bids'][:5])
+                ask_v = sum(Decimal(x[1]) for x in d['asks'][:5])
+                return (bid + ask) / 2, (bid_v - ask_v) / (bid_v + ask_v)
         except: return None, None
 
     async def run(self):
-        log.info("🐅 V22 PREDATOR LIVE | Trailing Stops Active")
+        log.info("🤖 V23 TERMINATOR | Trend-Lock Active")
         async with aiohttp.ClientSession() as session:
             while True:
                 price, imb = await self.fetch(session)
                 if price is None: continue
                 self.price_hist.append(price)
 
-                if len(self.price_hist) < 30:
+                if len(self.price_hist) < 50:
                     await asyncio.sleep(1); continue
 
-                # Logic Gates
+                # --- PRO FILTERS ---
+                avg_p = sum(self.price_hist) / len(self.price_hist)
                 vol = (max(self.price_hist) - min(self.price_hist)) / min(self.price_hist)
-                up_sig = imb > CONFIG["IMB_THRESHOLD"] and price > self.price_hist[-15] and vol > CONFIG["VOL_MIN"]
-                dn_sig = imb < -CONFIG["IMB_THRESHOLD"] and price < self.price_hist[-15] and vol > CONFIG["VOL_MIN"]
+                
+                # Only Buy if price is above average (Trend), Only Sell if below
+                up_sig = imb > CONFIG["IMB_THRESHOLD"] and price > avg_p and vol > CONFIG["VOL_MIN"]
+                dn_sig = imb < -CONFIG["IMB_THRESHOLD"] and price < avg_p and vol > CONFIG["VOL_MIN"]
 
-                if time.time() - self.last_trade < 10:
+                if time.time() - self.last_trade < 20: # Longer cooldown to avoid overtrading
                     await asyncio.sleep(CONFIG["POLL"]); continue
 
                 side = "BUY" if up_sig else "SELL" if dn_sig else None
                 if side:
                     entry, start_t = price, time.time()
                     self.last_trade = start_t
-                    sl_price = entry * (Decimal("0.9975") if side == "BUY" else Decimal("1.0025"))
-                    log.info(f"🚀 {side} @ {entry} | Vol: {round(vol*100,3)}%")
+                    # Initial Stop Loss
+                    sl = entry * (Decimal("0.9965") if side == "BUY" else Decimal("1.0035"))
+                    log.info(f"🚀 {side} @ {entry} | Trend: {'UP' if side=='BUY' else 'DN'}")
 
                     while True:
                         p, _ = await self.fetch(session)
                         if p is None: continue
-                        
                         move = (p - entry) / entry if side == "BUY" else (entry - p) / entry
                         
-                        # 1. Trailing Stop (Move SL to Breakeven after 0.2% gain)
-                        if move >= Decimal("0.0020"):
-                            sl_price = entry # Can't lose money now!
+                        # --- DYNAMIC RECOVERY ---
+                        # If up 0.25%, lock in profit at entry + fee
+                        if move >= Decimal("0.0025"):
+                            sl = entry * (Decimal("1.001") if side == "BUY" else Decimal("0.999"))
 
-                        # 2. Exit Conditions
+                        # --- EXIT GATES ---
                         if move >= CONFIG["TP"]: res = "✅ TP"; break
-                        if (side == "BUY" and p <= sl_price) or (side == "SELL" and p >= sl_price):
+                        if (side == "BUY" and p <= sl) or (side == "SELL" and p >= sl):
                             res = "❌ SL"; break
-                        
-                        # 3. Dynamic Time Exit (Only kill if losing after 5 mins)
-                        if time.time() - start_t > CONFIG["MAX_HOLD"] and move < 0:
+                        if time.time() - start_t > CONFIG["MAX_HOLD"]:
                             res = "⌛ TIME"; break
-                        elif time.time() - start_t > CONFIG["MAX_HOLD"] * 2: # Hard cap 10 mins
-                            res = "⌛ MAX_TIME"; break
-
-                        await asyncio.sleep(0.3)
+                        
+                        await asyncio.sleep(0.5)
 
                     pnl = CONFIG["TRADE_SIZE"] * (move - CONFIG["FEE"])
                     self.balance += pnl
-                    log.info(f"{res} | Move: {round(move*100,3)}% | Net: ${round(pnl,4)} | Bal: ${round(self.balance,3)}")
+                    log.info(f"{res} | Net: ${round(pnl,4)} | Bal: ${round(self.balance,3)}")
 
                 await asyncio.sleep(CONFIG["POLL"])
 
 if __name__ == "__main__":
-    asyncio.run(SniperV22().run())
+    asyncio.run(SniperV23().run())
