@@ -23,7 +23,7 @@ logger = logging.getLogger("WeightWatcher-Master")
 
 class WeightWatcherMaster:
     def __init__(self):
-        self.shadow_balance = Decimal("10.00")
+        self.shadow_balance = Decimal("3.00")
         self.news_multiplier = Decimal("1.0")
         self.hot_keywords = ["BREAKING", "CRASH", "SEC", "LIQUIDATION", "PUMP", "SURGE", "ETF"]
 
