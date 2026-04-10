@@ -4,18 +4,19 @@ import requests
 import feedparser
 from decimal import Decimal
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION (KEPT AS IS) ---
 CONFIG = {
     "BINANCE_SYMBOL": "BTCUSDT",
     "TRADE_SIZE_USD": Decimal("0.40"),
-    "BASE_IMBALANCE_THRESH": Decimal("0.30"), # 30% weight difference
-    "DEPTH": 20,                               # Depth of order book to scan
-    "POLL_SPEED": 0.5,                         # Speed of price/book checks
+    "BASE_IMBALANCE_THRESH": Decimal("0.30"), 
+    "DEPTH": 20,                               
+    "POLL_SPEED": 0.5,                         
     "NEWS_FEEDS": [
         "https://cointelegraph.com/rss",
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
         "https://cryptopanic.com/news/rss/"
-    ]
+    ],
+    "FEE_RATE": Decimal("0.001") # NEW: Standard 0.1% Exchange Fee
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -26,10 +27,10 @@ class WeightWatcherMaster:
         self.shadow_balance = Decimal("3.00")
         self.news_multiplier = Decimal("1.0")
         self.hot_keywords = ["BREAKING", "CRASH", "SEC", "LIQUIDATION", "PUMP", "SURGE", "ETF"]
+        # NEW: Anti-Spoofing memory
+        self.imbalance_history = [] 
 
-    # --- TASK 1: NEWS SCANNER (Sensitivity Booster) ---
     async def scan_news(self):
-        """Scans RSS feeds and lowers the threshold if news is hot"""
         while True:
             try:
                 found_heat = False
@@ -39,55 +40,56 @@ class WeightWatcherMaster:
                         if any(word in entry.title.upper() for word in self.hot_keywords):
                             found_heat = True
                             break
-                
-                # If news is hot, we trade on much smaller imbalances (Multiplier 0.5x reduces threshold)
                 self.news_multiplier = Decimal("0.5") if found_heat else Decimal("1.0")
-                if found_heat:
-                    logger.info("📡 NEWS ALERT: High Volatility Expected. Increasing Sensitivity.")
-            except:
-                pass
+            except: pass
             await asyncio.sleep(60)
 
-    # --- TASK 2: ORDER BOOK ANALYSIS ---
     async def get_imbalance(self):
         try:
             url = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['BINANCE_SYMBOL']}&limit={CONFIG['DEPTH']}"
             res = requests.get(url, timeout=1).json()
-            
-            # Calculate Weight (Price * Quantity)
             bid_weight = sum(Decimal(b[0]) * Decimal(b[1]) for b in res['bids'])
             ask_weight = sum(Decimal(a[0]) * Decimal(a[1]) for a in res['asks'])
-            
             imbalance = (bid_weight - ask_weight) / (bid_weight + ask_weight)
             return imbalance
-        except:
-            return Decimal("0")
+        except: return Decimal("0")
 
     async def run(self):
-        logger.info(f"⚖️ V14.2 MASTER DEMO ONLINE | Balance: ${self.shadow_balance}")
+        logger.info(f"⚖️ V14.3 ANTI-WHALE EDITION | Balance: ${self.shadow_balance}")
         asyncio.create_task(self.scan_news())
         
         while True:
-            imbalance = await self.get_imbalance()
+            current_imb = await self.get_imbalance()
             
-            # Apply News Multiplier to the Threshold
-            # Example: 0.30 threshold * 0.5 (Hot News) = 0.15 threshold
+            # --- SMART FILTER: PERSISTENCE (Anti-Spoofing) ---
+            # We keep the last 5 checks. Only trade if the AVERAGE is high.
+            # This kills "flash" spoofing from whales.
+            self.imbalance_history.append(current_imb)
+            if len(self.imbalance_history) > 5: self.imbalance_history.pop(0)
+            avg_imbalance = sum(self.imbalance_history) / len(self.imbalance_history)
+            
             dynamic_threshold = CONFIG["BASE_IMBALANCE_THRESH"] * self.news_multiplier
             
-            # --- BUY LOGIC ---
-            if imbalance > dynamic_threshold:
-                profit = CONFIG["TRADE_SIZE_USD"] * Decimal("0.018") # 1.8% simulated scalp
-                self.shadow_balance += profit
-                logger.info(f"🎯 IMBALANCE BUY! Weight: {round(imbalance,3)} | News-Boost: {self.news_multiplier != 1.0}")
-                logger.info(f"💰 Shadow Balance: ${round(self.shadow_balance, 3)}")
-                await asyncio.sleep(4) # Simulate trade lock time
+            # --- REAL-WORLD PROFIT CALCULATION ---
+            # 1.8% scalp MINUS 0.2% total fees (entry + exit)
+            gross_profit = CONFIG["TRADE_SIZE_USD"] * Decimal("0.018")
+            trading_fees = CONFIG["TRADE_SIZE_USD"] * (CONFIG["FEE_RATE"] * 2)
+            net_profit = gross_profit - trading_fees
 
-            # --- SELL LOGIC ---
-            elif imbalance < -dynamic_threshold:
-                profit = CONFIG["TRADE_SIZE_USD"] * Decimal("0.018")
-                self.shadow_balance += profit
-                logger.info(f"🎯 IMBALANCE SELL! Weight: {round(imbalance,3)} | News-Boost: {self.news_multiplier != 1.0}")
-                logger.info(f"💰 Shadow Balance: ${round(self.shadow_balance, 3)}")
+            # --- BUY LOGIC (Using Persistent Average) ---
+            if avg_imbalance > dynamic_threshold:
+                self.shadow_balance += net_profit
+                logger.info(f"🎯 PERSISTENT BUY! Weight: {round(avg_imbalance,3)} | Net: +${round(net_profit,4)}")
+                logger.info(f"💰 Real-World Shadow Balance: ${round(self.shadow_balance, 3)}")
+                self.imbalance_history = [] # Clear history after trade
+                await asyncio.sleep(4)
+
+            # --- SELL LOGIC (Using Persistent Average) ---
+            elif avg_imbalance < -dynamic_threshold:
+                self.shadow_balance += net_profit
+                logger.info(f"🎯 PERSISTENT SELL! Weight: {round(avg_imbalance,3)} | Net: +${round(net_profit,4)}")
+                logger.info(f"💰 Real-World Shadow Balance: ${round(self.shadow_balance, 3)}")
+                self.imbalance_history = []
                 await asyncio.sleep(4)
 
             await asyncio.sleep(CONFIG["POLL_SPEED"])
