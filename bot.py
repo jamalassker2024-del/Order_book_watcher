@@ -1,101 +1,102 @@
 import asyncio
-import aiohttp
+import json
 import logging
-import time
+import websockets
 from decimal import Decimal
 from collections import deque
+import time
 
 CONFIG = {
-    "SYMBOL": "PEPEUSDT",
-    "TRADE_SIZE_USD": Decimal("1.0"),
+    "SYMBOL": "pepeusdt",
+    "TRADE_SIZE": Decimal("1.0"),
 
-    "IMB_THRESHOLD": Decimal("0.12"),   # lower = more trades
-    "MAX_TRADES": 5,                    # allow multiple trades
-    "COOLDOWN": 1.5,                    # seconds between entries
+    "LEVELS": 10,                 # depth levels used
+    "IMB_THRESHOLD": Decimal("0.15"),
+    "DELTA_THRESHOLD": Decimal("0.05"),  # acceleration
 
+    "MAX_TRADES": 7,
+    "TP": Decimal("0.004"),
+    "SL": Decimal("-0.004"),
     "FEE": Decimal("0.001"),
-    "BASE_TP": Decimal("0.004"),        # 0.4%
-    "BASE_SL": Decimal("-0.004"),       # -0.4%
 
-    "POLL": 0.3
+    "COOLDOWN": 1.0
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
-log = logging.getLogger("SCALPER")
+log = logging.getLogger("ORDERFLOW")
 
 class Trade:
     def __init__(self, side, entry):
         self.side = side
         self.entry = entry
-        self.open_time = time.time()
+        self.time = time.time()
 
-class ScalperBot:
+class OrderBookBot:
     def __init__(self):
         self.balance = Decimal("30")
         self.trades = []
-        self.last_entry_time = 0
 
-        self.imb_history = deque(maxlen=10)
+        self.imb_history = deque(maxlen=5)
+        self.last_entry = 0
 
-    async def fetch(self, session):
-        try:
-            url1 = f"https://api.binance.com/api/v3/ticker/bookTicker?symbol={CONFIG['SYMBOL']}"
-            url2 = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['SYMBOL']}&limit=5"
+    def calc_imbalance(self, bids, asks):
+        bid_vol = sum(Decimal(b[1]) for b in bids[:CONFIG["LEVELS"]])
+        ask_vol = sum(Decimal(a[1]) for a in asks[:CONFIG["LEVELS"]])
 
-            async with session.get(url1) as r1, session.get(url2) as r2:
-                p = await r1.json()
-                d = await r2.json()
+        if bid_vol + ask_vol == 0:
+            return Decimal("0")
 
-            bid = Decimal(p['bidPrice'])
-            ask = Decimal(p['askPrice'])
+        return (bid_vol - ask_vol) / (bid_vol + ask_vol)
 
-            bid_w = sum(Decimal(b[0]) * Decimal(b[1]) for b in d['bids'])
-            ask_w = sum(Decimal(a[0]) * Decimal(a[1]) for a in d['asks'])
-
-            imb = (bid_w - ask_w) / (bid_w + ask_w)
-
-            return bid, ask, imb
-        except:
-            return None
-
-    def smooth_imbalance(self, imb):
-        self.imb_history.append(imb)
-        return sum(self.imb_history) / len(self.imb_history)
+    def get_price(self, bids, asks, side):
+        return Decimal(asks[0][0]) if side == "BUY" else Decimal(bids[0][0])
 
     async def run(self):
-        log.info("🚀 SCALPER STARTED")
+        url = f"wss://stream.binance.com:9443/ws/{CONFIG['SYMBOL']}@depth@100ms"
 
-        async with aiohttp.ClientSession() as session:
+        log.info("🚀 Order Book Imbalance Bot Started")
+
+        async with websockets.connect(url) as ws:
             while True:
-                data = await self.fetch(session)
-                if not data:
-                    await asyncio.sleep(CONFIG["POLL"])
+                data = json.loads(await ws.recv())
+
+                bids = data.get("b", [])
+                asks = data.get("a", [])
+
+                if not bids or not asks:
                     continue
 
-                bid, ask, imb = data
-                imb = self.smooth_imbalance(imb)
+                imb = self.calc_imbalance(bids, asks)
+                self.imb_history.append(imb)
 
-                # 🔍 ENTRY LOGIC
+                # 🔥 detect acceleration
+                if len(self.imb_history) < 2:
+                    continue
+
+                delta = self.imb_history[-1] - self.imb_history[0]
+
                 now = time.time()
 
+                # 🚀 ENTRY LOGIC (pressure + acceleration)
                 if (
                     abs(imb) > CONFIG["IMB_THRESHOLD"]
+                    and abs(delta) > CONFIG["DELTA_THRESHOLD"]
                     and len(self.trades) < CONFIG["MAX_TRADES"]
-                    and now - self.last_entry_time > CONFIG["COOLDOWN"]
+                    and now - self.last_entry > CONFIG["COOLDOWN"]
                 ):
                     side = "BUY" if imb > 0 else "SELL"
-                    entry = ask if side == "BUY" else bid
+                    entry = self.get_price(bids, asks, side)
 
                     self.trades.append(Trade(side, entry))
-                    self.last_entry_time = now
+                    self.last_entry = now
 
-                    log.info(f"🚀 OPEN {side} @ {entry} | Active: {len(self.trades)}")
+                    log.info(f"🚀 {side} @ {entry} | Imb: {round(imb,3)} Δ:{round(delta,3)}")
 
                 # 🔄 MANAGE TRADES
                 still_open = []
 
                 for t in self.trades:
-                    current = bid if t.side == "BUY" else ask
+                    current = self.get_price(bids, asks, t.side)
 
                     move = (
                         (current - t.entry) / t.entry
@@ -105,24 +106,15 @@ class ScalperBot:
 
                     net = move - (CONFIG["FEE"] * 2)
 
-                    # dynamic TP/SL
-                    tp = CONFIG["BASE_TP"]
-                    sl = CONFIG["BASE_SL"]
-
-                    if net >= tp or net <= sl:
-                        pnl = CONFIG["TRADE_SIZE_USD"] * net
+                    if net >= CONFIG["TP"] or net <= CONFIG["SL"]:
+                        pnl = CONFIG["TRADE_SIZE"] * net
                         self.balance += pnl
 
                         log.info(
                             f"{'💰 WIN' if net>0 else '❌ LOSS'} "
-                            f"{t.side} | {round(net*100,3)}% | Bal: {round(self.balance,2)}"
+                            f"{t.side} {round(net*100,3)}% | Bal: {round(self.balance,2)}"
                         )
                     else:
                         still_open.append(t)
 
                 self.trades = still_open
-
-                await asyncio.sleep(CONFIG["POLL"])
-
-if __name__ == "__main__":
-    asyncio.run(ScalperBot().run())
