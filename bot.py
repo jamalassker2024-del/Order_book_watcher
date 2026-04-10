@@ -7,7 +7,7 @@ from decimal import Decimal
 # --- CONFIGURATION ---
 CONFIG = {
     "BINANCE_SYMBOL": "BTCUSDT",
-    "TRADE_SIZE_USD": Decimal("1.00"),
+    "TRADE_SIZE_USD": Decimal(".30"),
     "BASE_IMBALANCE_THRESH": Decimal("0.30"), # 30% weight difference
     "DEPTH": 20,                               # Depth of order book to scan
     "POLL_SPEED": 0.5,                         # Speed of price/book checks
