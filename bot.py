@@ -8,9 +8,10 @@ from decimal import Decimal
 CONFIG = {
     "BINANCE_SYMBOL": "BTCUSDT",
     "TRADE_SIZE_USD": Decimal(".30"),
-    "BASE_IMBALANCE_THRESH": Decimal("0.30"), # 30% weight difference
-    "DEPTH": 20,                               # Depth of order book to scan
-    "POLL_SPEED": 0.5,                         # Speed of price/book checks
+    "BASE_IMBALANCE_THRESH": Decimal("0.30"), 
+    "CONVERT_SPREAD": Decimal("0.001"),        # 0.1% Hidden Spread fee
+    "DEPTH": 20,                               
+    "POLL_SPEED": 0.5,                         
     "NEWS_FEEDS": [
         "https://cointelegraph.com/rss",
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -23,13 +24,11 @@ logger = logging.getLogger("WeightWatcher-Master")
 
 class WeightWatcherMaster:
     def __init__(self):
-        self.shadow_balance = Decimal("3.00")
+        self.shadow_balance = Decimal("77.70") # Adjusted to your stated balance
         self.news_multiplier = Decimal("1.0")
         self.hot_keywords = ["BREAKING", "CRASH", "SEC", "LIQUIDATION", "PUMP", "SURGE", "ETF"]
 
-    # --- TASK 1: NEWS SCANNER (Sensitivity Booster) ---
     async def scan_news(self):
-        """Scans RSS feeds and lowers the threshold if news is hot"""
         while True:
             try:
                 found_heat = False
@@ -39,56 +38,66 @@ class WeightWatcherMaster:
                         if any(word in entry.title.upper() for word in self.hot_keywords):
                             found_heat = True
                             break
-                
-                # If news is hot, we trade on much smaller imbalances (Multiplier 0.5x reduces threshold)
                 self.news_multiplier = Decimal("0.5") if found_heat else Decimal("1.0")
-                if found_heat:
-                    logger.info("📡 NEWS ALERT: High Volatility Expected. Increasing Sensitivity.")
             except:
                 pass
             await asyncio.sleep(60)
 
-    # --- TASK 2: ORDER BOOK ANALYSIS ---
-    async def get_imbalance(self):
+    async def get_market_data(self):
+        """Fetches both imbalance and the current mid-price"""
         try:
             url = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['BINANCE_SYMBOL']}&limit={CONFIG['DEPTH']}"
             res = requests.get(url, timeout=1).json()
             
-            # Calculate Weight (Price * Quantity)
+            # Calculate Weight
             bid_weight = sum(Decimal(b[0]) * Decimal(b[1]) for b in res['bids'])
             ask_weight = sum(Decimal(a[0]) * Decimal(a[1]) for a in res['asks'])
-            
             imbalance = (bid_weight - ask_weight) / (bid_weight + ask_weight)
-            return imbalance
+            
+            # Get Mid-Price
+            mid_price = (Decimal(res['bids'][0][0]) + Decimal(res['asks'][0][0])) / 2
+            return imbalance, mid_price
         except:
-            return Decimal("0")
+            return Decimal("0"), Decimal("0")
 
     async def run(self):
-        logger.info(f"⚖️ V14.2 MASTER DEMO ONLINE | Balance: ${self.shadow_balance}")
+        logger.info(f"⚖️ V14.3 TRUTH EDITION ONLINE | Balance: ${self.shadow_balance}")
         asyncio.create_task(self.scan_news())
         
         while True:
-            imbalance = await self.get_imbalance()
-            
-            # Apply News Multiplier to the Threshold
-            # Example: 0.30 threshold * 0.5 (Hot News) = 0.15 threshold
+            imbalance, entry_price = await self.get_market_data()
             dynamic_threshold = CONFIG["BASE_IMBALANCE_THRESH"] * self.news_multiplier
             
-            # --- BUY LOGIC ---
+            direction = None
             if imbalance > dynamic_threshold:
-                profit = CONFIG["TRADE_SIZE_USD"] * Decimal("0.018") # 1.8% simulated scalp
-                self.shadow_balance += profit
-                logger.info(f"🎯 IMBALANCE BUY! Weight: {round(imbalance,3)} | News-Boost: {self.news_multiplier != 1.0}")
-                logger.info(f"💰 Shadow Balance: ${round(self.shadow_balance, 3)}")
-                await asyncio.sleep(4) # Simulate trade lock time
-
-            # --- SELL LOGIC ---
+                direction = "BUY"
             elif imbalance < -dynamic_threshold:
-                profit = CONFIG["TRADE_SIZE_USD"] * Decimal("0.018")
-                self.shadow_balance += profit
-                logger.info(f"🎯 IMBALANCE SELL! Weight: {round(imbalance,3)} | News-Boost: {self.news_multiplier != 1.0}")
-                logger.info(f"💰 Shadow Balance: ${round(self.shadow_balance, 3)}")
-                await asyncio.sleep(4)
+                direction = "SELL"
+
+            if direction and entry_price > 0:
+                logger.info(f"🎯 {direction} TRIGGERED! Weight: {round(imbalance,3)} | Price: ${entry_price}")
+                
+                # Wait 5 seconds for the market to move (Trade Lock Time)
+                await asyncio.sleep(5) 
+                
+                # Check price again after the wait
+                _, exit_price = await self.get_market_data()
+                
+                # Calculate real PnL (including the hidden 0.1% convert spread)
+                if direction == "BUY":
+                    price_change = (exit_price - entry_price) / entry_price
+                else:
+                    price_change = (entry_price - exit_price) / entry_price
+                
+                # Net Profit = (Price Move %) - (Convert Fee %)
+                net_profit_pct = price_change - CONFIG["CONVERT_SPREAD"]
+                real_pnl = CONFIG["TRADE_SIZE_USD"] * net_profit_pct
+                
+                self.shadow_balance += real_pnl
+                
+                outcome = "✅ WIN" if real_pnl > 0 else "❌ LOSS"
+                logger.info(f"{outcome} | Move: {round(price_change*100, 4)}% | Net PnL: ${round(real_pnl, 4)}")
+                logger.info(f"💰 Real Shadow Balance: ${round(self.shadow_balance, 3)}")
 
             await asyncio.sleep(CONFIG["POLL_SPEED"])
 
