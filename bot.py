@@ -1,159 +1,133 @@
 import asyncio
 import logging
-import aiohttp
+import requests
 from decimal import Decimal
 from collections import deque
 import time
 
 # --- CONFIG ---
 CONFIG = {
-    "SYMBOL": "BTCUSDT",
+    "BINANCE_SYMBOL": "BTCUSDT",
     "TRADE_SIZE_USD": Decimal("0.30"),
 
-    "WINNER_THRESHOLD": Decimal("0.90"),
+    "WINNER_THRESHOLD": Decimal("0.75"),   # ✅ FIXED
+    "SPREAD_LIMIT": Decimal("0.0005"),     # 0.05%
+    "FEE": Decimal("0.001"),               # 0.1%
 
-    "TP": Decimal("0.003"),   # 0.3%
-    "SL": Decimal("0.003"),   # 0.3%
-
-    "SPREAD_MAX": Decimal("0.0004"),  # 0.04%
-
-    "FEE": Decimal("0.001"),  # 0.1% per side
-
-    "MOMENTUM_MIN": Decimal("0.0015"),  # 0.15%
-
+    "TRADE_DURATION": 20,                  # ✅ faster exits
     "DEPTH": 20,
-    "POLL_SPEED": 1.0,
-
-    "COOLDOWN": 10
+    "POLL_SPEED": 1,
+    "COOLDOWN": 10                        # ✅ prevent spam
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger("Sniper-V16")
+logger = logging.getLogger("SNIPER-V17")
 
-
-class SniperV16:
+class SniperBot:
     def __init__(self):
         self.balance = Decimal("77.69")
-        self.price_history = deque(maxlen=30)
-        self.position = None
+        self.price_history = deque(maxlen=15)   # ✅ faster trend
         self.last_trade_time = 0
 
-    async def fetch_data(self, session):
+    def get_market_data(self):
         try:
-            url = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['SYMBOL']}&limit={CONFIG['DEPTH']}"
-            async with session.get(url, timeout=1) as resp:
-                data = await resp.json()
+            url = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['BINANCE_SYMBOL']}&limit={CONFIG['DEPTH']}"
+            data = requests.get(url, timeout=2).json()
 
-            bids = data["bids"]
-            asks = data["asks"]
+            bids = data['bids']
+            asks = data['asks']
 
-            bid_w = sum(Decimal(b[0]) * Decimal(b[1]) for b in bids)
-            ask_w = sum(Decimal(a[0]) * Decimal(a[1]) for a in asks)
+            bid_vol = sum(Decimal(b[1]) for b in bids)
+            ask_vol = sum(Decimal(a[1]) for a in asks)
+
+            imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
 
             best_bid = Decimal(bids[0][0])
             best_ask = Decimal(asks[0][0])
 
-            mid = (best_bid + best_ask) / 2
-            spread = (best_ask - best_bid) / best_bid
-            imbalance = (bid_w - ask_w) / (bid_w + ask_w)
+            mid_price = (best_bid + best_ask) / 2
 
-            return imbalance, mid, spread
+            spread = (best_ask - best_bid) / best_bid  # ✅ FIXED
 
-        except:
-            return None, None, None
+            return imbalance, mid_price, spread
 
-    def momentum(self):
-        if len(self.price_history) < 30:
-            return None
-        old = self.price_history[0]
-        new = self.price_history[-1]
-        return (new - old) / old
-
-    async def check_entry(self, imbalance, price, spread):
-        now = time.time()
-
-        if self.position is not None:
-            return
-
-        if now - self.last_trade_time < CONFIG["COOLDOWN"]:
-            return
-
-        if spread > CONFIG["SPREAD_MAX"]:
-            return
-
-        mom = self.momentum()
-        if mom is None:
-            return
-
-        direction = None
-
-        if imbalance > CONFIG["WINNER_THRESHOLD"] and mom > CONFIG["MOMENTUM_MIN"]:
-            direction = "BUY"
-
-        elif imbalance < -CONFIG["WINNER_THRESHOLD"] and mom < -CONFIG["MOMENTUM_MIN"]:
-            direction = "SELL"
-
-        if direction:
-            self.position = {
-                "side": direction,
-                "entry": price,
-                "open_time": now
-            }
-
-            logger.info(f"🚀 ENTRY {direction} | Price: {price} | Imb: {round(imbalance,3)} | Mom: {round(mom,4)}")
-
-    async def manage_trade(self, price):
-        if self.position is None:
-            return
-
-        entry = self.position["entry"]
-        side = self.position["side"]
-
-        move = (price - entry) / entry
-        if side == "SELL":
-            move = -move
-
-        # TP / SL check
-        if move >= CONFIG["TP"] or move <= -CONFIG["SL"]:
-            await self.close_trade(price, move)
-
-    async def close_trade(self, price, move):
-        size = CONFIG["TRADE_SIZE_USD"]
-
-        gross = size * Decimal(str(move))
-        fees = size * CONFIG["FEE"] * 2
-        pnl = gross - fees
-
-        self.balance += pnl
-        self.last_trade_time = time.time()
-
-        status = "💰 WIN" if pnl > 0 else "💀 LOSS"
-
-        logger.info(f"{status} EXIT | Move: {round(move*100,3)}% | PnL: {round(pnl,5)}")
-        logger.info(f"🏦 Balance: {round(self.balance, 3)}")
-
-        self.position = None
+        except Exception as e:
+            logger.warning(f"API error: {e}")
+            return Decimal("0"), Decimal("0"), Decimal("0")
 
     async def run(self):
-        logger.info("🔥 SNIPER V16 LIVE (REALISTIC MODE)")
+        logger.info("🔥 SNIPER V17 LIVE (ACTIVE MODE)")
 
-        async with aiohttp.ClientSession() as session:
-            while True:
-                imbalance, price, spread = await self.fetch_data(session)
+        while True:
+            imb, price, spread = self.get_market_data()
 
-                if price is None:
-                    await asyncio.sleep(1)
-                    continue
+            if price == 0:
+                await asyncio.sleep(1)
+                continue
 
-                self.price_history.append(price)
+            self.price_history.append(price)
 
-                logger.info(f"Price: {price} | Imb: {round(imbalance,3)} | Spread: {round(spread,5)}")
+            logger.info(f"Price: {price} | Imb: {round(imb,3)} | Spread: {round(spread,6)}")
 
-                await self.check_entry(imbalance, price, spread)
-                await self.manage_trade(price)
+            # --- CONDITIONS ---
+            if len(self.price_history) < 10:
+                await asyncio.sleep(1)
+                continue
 
-                await asyncio.sleep(CONFIG["POLL_SPEED"])
+            old_price = self.price_history[0]
 
+            uptrend = price > old_price
+            downtrend = price < old_price
+
+            now = time.time()
+
+            # Cooldown
+            if now - self.last_trade_time < CONFIG["COOLDOWN"]:
+                continue
+
+            # Spread filter
+            if spread > CONFIG["SPREAD_LIMIT"]:
+                logger.info("⛔ Skipped: Spread too high")
+                continue
+
+            # --- SIGNAL ---
+            direction = None
+
+            if imb > CONFIG["WINNER_THRESHOLD"] and uptrend:
+                direction = "BUY"
+
+            elif imb < -CONFIG["WINNER_THRESHOLD"] and downtrend:
+                direction = "SELL"
+
+            # --- EXECUTION ---
+            if direction:
+                logger.info(f"🚀 TRADE {direction} | Imb: {round(imb,3)}")
+
+                entry_price = price
+                self.last_trade_time = now
+
+                await asyncio.sleep(CONFIG["TRADE_DURATION"])
+
+                _, exit_price, _ = self.get_market_data()
+
+                if direction == "BUY":
+                    move = (exit_price - entry_price) / entry_price
+                else:
+                    move = (entry_price - exit_price) / entry_price
+
+                net_move = move - CONFIG["FEE"]
+
+                pnl = CONFIG["TRADE_SIZE_USD"] * net_move
+                self.balance += pnl
+
+                if pnl > 0:
+                    logger.info(f"💰 WIN | PnL: {round(pnl,4)}")
+                else:
+                    logger.info(f"💀 LOSS | PnL: {round(pnl,4)}")
+
+                logger.info(f"🏦 Balance: {round(self.balance,2)}")
+
+            await asyncio.sleep(CONFIG["POLL_SPEED"])
 
 if __name__ == "__main__":
-    asyncio.run(SniperV16().run())
+    asyncio.run(SniperBot().run())
