@@ -10,28 +10,30 @@ CONFIG = {
     "SYMBOL": "BTCUSDT",
     "TRADE_SIZE": Decimal("2.0"),
 
-    "IMB_THRESHOLD": Decimal("0.85"), # 🎯 Strict: Only high-conviction imbalances
-    "IMB_ACCEL": Decimal("0.20"),     # 🚀 Momentum requirement
+    "IMB_THRESHOLD": Decimal("0.80"), # 🎯 Slightly adjusted for more activity
+    "IMB_ACCEL": Decimal("0.15"),     # 🚀 Momentum requirement
     
-    "VOL_MIN": Decimal("0.0006"),     # 📊 Volatility Filter: Price must move 0.06% in history
+    "VOL_MIN": Decimal("0.0005"),     # 📊 Price must move at least 0.05% 
     
-    "TP": Decimal("0.0045"),          # ✅ 0.45% Take Profit (4.5x the fee)
-    "SL": Decimal("0.0020"),          # ❌ 0.20% Stop Loss (Protects capital)
+    "TP": Decimal("0.0040"),          # ✅ 0.40% Take Profit
+    "SL": Decimal("0.0020"),          # ❌ 0.20% Stop Loss
     
-    "FEE": Decimal("0.001"),          # 0.1% Binance Spread/Fee
-    "MAX_HOLD": 180,                  # ⌛ 3-minute patience (prevents "TIME" losses)
+    "FEE": Decimal("0.001"),          
+    "MAX_HOLD": 180,                  
     "POLL": 0.4,
+    "HEARTBEAT_INTERVAL": 60          # 💓 Diagnostic log every 60 seconds
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-log = logging.getLogger("V21-EXECUTIONER")
+log = logging.getLogger("V21.1-HEARTBEAT")
 
 class SniperV21:
     def __init__(self):
         self.balance = Decimal("77.69")
-        self.price_hist = deque(maxlen=20) # 20 ticks for better trend/vol analysis
+        self.price_hist = deque(maxlen=20) 
         self.imb_hist = deque(maxlen=10)
         self.last_trade = 0
+        self.last_heartbeat = time.time()
 
     async def fetch(self, session):
         try:
@@ -48,7 +50,7 @@ class SniperV21:
             return None, None
 
     async def run(self):
-        log.info("🎯 V21 EXECUTIONER LIVE | Volatility Filter Active")
+        log.info("🎯 V21.1 HEARTBEAT ONLINE | Diagnostic Mode Active")
         async with aiohttp.ClientSession() as session:
             while True:
                 price, imb = await self.fetch(session)
@@ -61,22 +63,27 @@ class SniperV21:
                     await asyncio.sleep(1)
                     continue
 
-                # --- 1. VOLATILITY CHECK (Anti-Chop) ---
-                high = max(self.price_hist)
-                low = min(self.price_hist)
+                # --- CALCULATIONS ---
+                high, low = max(self.price_hist), min(self.price_hist)
                 current_vol = (high - low) / low
-                is_volatile = current_vol >= CONFIG["VOL_MIN"]
-
-                # --- 2. TREND & MOMENTUM ---
                 imb_change = self.imb_hist[-1] - self.imb_hist[0]
+                
+                # --- HEARTBEAT DIAGNOSTIC ---
+                if time.time() - self.last_heartbeat > CONFIG["HEARTBEAT_INTERVAL"]:
+                    reason = "OK"
+                    if current_vol < CONFIG["VOL_MIN"]: reason = "Market Too Quiet (Low Vol)"
+                    elif abs(imb) < CONFIG["IMB_THRESHOLD"]: reason = "Waiting for Whale Imbalance"
+                    log.info(f"💓 HEARTBEAT | Bal: ${round(self.balance,3)} | Imb: {round(imb,2)} | Vol: {round(current_vol*100,3)}% | Status: {reason}")
+                    self.last_heartbeat = time.time()
+
+                # --- TRIGGERS ---
+                is_volatile = current_vol >= CONFIG["VOL_MIN"]
                 price_trend_up = price > self.price_hist[0]
                 price_trend_down = price < self.price_hist[0]
 
-                # --- 3. THE TRIGGER ---
                 up_sig = imb > CONFIG["IMB_THRESHOLD"] and imb_change > CONFIG["IMB_ACCEL"] and price_trend_up and is_volatile
                 down_sig = imb < -CONFIG["IMB_THRESHOLD"] and imb_change < -CONFIG["IMB_ACCEL"] and price_trend_down and is_volatile
 
-                # Cooldown & Entry
                 if (time.time() - self.last_trade < 15):
                     await asyncio.sleep(CONFIG["POLL"])
                     continue
@@ -92,7 +99,6 @@ class SniperV21:
                     while True:
                         p, _ = await self.fetch(session)
                         if p is None: continue
-
                         raw_move = (p - entry) / entry if direction == "BUY" else (entry - p) / entry
                         
                         if raw_move >= CONFIG["TP"]:
@@ -104,10 +110,8 @@ class SniperV21:
                         elif time.time() - start_time > CONFIG["MAX_HOLD"]:
                             res = "⌛ TIME"
                             break
-                        
                         await asyncio.sleep(0.3)
 
-                    # Calculation
                     net_pnl = CONFIG["TRADE_SIZE"] * (raw_move - CONFIG["FEE"])
                     self.balance += net_pnl
                     log.info(f"{res} | Move: {round(raw_move*100,3)}% | Net: ${round(net_pnl,4)} | Bal: ${round(self.balance,3)}")
