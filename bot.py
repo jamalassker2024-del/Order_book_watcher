@@ -3,103 +3,89 @@ import logging
 import requests
 import feedparser
 from decimal import Decimal
+from collections import deque
 
 # --- CONFIGURATION ---
 CONFIG = {
     "BINANCE_SYMBOL": "BTCUSDT",
     "TRADE_SIZE_USD": Decimal(".30"),
-    "BASE_IMBALANCE_THRESH": Decimal("0.30"), 
-    "CONVERT_SPREAD": Decimal("0.001"),        # 0.1% Hidden Spread fee
-    "DEPTH": 20,                               
-    "POLL_SPEED": 0.5,                         
-    "NEWS_FEEDS": [
-        "https://cointelegraph.com/rss",
-        "https://www.coindesk.com/arc/outboundfeeds/rss/",
-        "https://cryptopanic.com/news/rss/"
-    ]
+    "WINNER_THRESHOLD": Decimal("0.90"),     # Only 90%+ imbalance triggers
+    "CONVERT_SPREAD": Decimal("0.001"),       # 0.1% real-world fee/spread
+    "TRADE_DURATION": 60,                     # Give it 60s to beat the fee
+    "DEPTH": 20,
+    "POLL_SPEED": 1.0,
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger("WeightWatcher-Master")
+logger = logging.getLogger("Sniper-Bot")
 
-class WeightWatcherMaster:
+class SniperBot:
     def __init__(self):
-        self.shadow_balance = Decimal("77.70") # Adjusted to your stated balance
-        self.news_multiplier = Decimal("1.0")
-        self.hot_keywords = ["BREAKING", "CRASH", "SEC", "LIQUIDATION", "PUMP", "SURGE", "ETF"]
-
-    async def scan_news(self):
-        while True:
-            try:
-                found_heat = False
-                for url in CONFIG["NEWS_FEEDS"]:
-                    feed = feedparser.parse(url)
-                    for entry in feed.entries[:3]:
-                        if any(word in entry.title.upper() for word in self.hot_keywords):
-                            found_heat = True
-                            break
-                self.news_multiplier = Decimal("0.5") if found_heat else Decimal("1.0")
-            except:
-                pass
-            await asyncio.sleep(60)
+        self.shadow_balance = Decimal("77.69") # Starting from your last log
+        self.price_history = deque(maxlen=30)  # Stores 30 seconds of price data
 
     async def get_market_data(self):
-        """Fetches both imbalance and the current mid-price"""
         try:
             url = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['BINANCE_SYMBOL']}&limit={CONFIG['DEPTH']}"
             res = requests.get(url, timeout=1).json()
-            
-            # Calculate Weight
-            bid_weight = sum(Decimal(b[0]) * Decimal(b[1]) for b in res['bids'])
-            ask_weight = sum(Decimal(a[0]) * Decimal(a[1]) for a in res['asks'])
-            imbalance = (bid_weight - ask_weight) / (bid_weight + ask_weight)
-            
-            # Get Mid-Price
+            bid_w = sum(Decimal(b[0]) * Decimal(b[1]) for b in res['bids'])
+            ask_w = sum(Decimal(a[0]) * Decimal(a[1]) for a in res['asks'])
+            imbalance = (bid_w - ask_w) / (bid_w + ask_w)
             mid_price = (Decimal(res['bids'][0][0]) + Decimal(res['asks'][0][0])) / 2
             return imbalance, mid_price
         except:
             return Decimal("0"), Decimal("0")
 
     async def run(self):
-        logger.info(f"⚖️ V14.3 TRUTH EDITION ONLINE | Balance: ${self.shadow_balance}")
-        asyncio.create_task(self.scan_news())
+        logger.info(f"🚀 SNIPER V15 ONLINE | Target: {CONFIG['WINNER_THRESHOLD']} Imbalance")
         
         while True:
-            imbalance, entry_price = await self.get_market_data()
-            dynamic_threshold = CONFIG["BASE_IMBALANCE_THRESH"] * self.news_multiplier
+            imb, current_price = await self.get_market_data()
+            if current_price == 0: continue
             
+            self.price_history.append(current_price)
+            
+            # --- TREND FILTER ---
+            # Only trade if we have 30s of data and price is moving our way
+            if len(self.price_history) < 30:
+                await asyncio.sleep(1)
+                continue
+                
+            old_price = self.price_history[0]
+            is_uptrend = current_price > old_price
+            is_downtrend = current_price < old_price
+
+            # --- SNIPER LOGIC ---
             direction = None
-            if imbalance > dynamic_threshold:
+            if imb > CONFIG["WINNER_THRESHOLD"] and is_uptrend:
                 direction = "BUY"
-            elif imbalance < -dynamic_threshold:
+            elif imb < -CONFIG["WINNER_THRESHOLD"] and is_downtrend:
                 direction = "SELL"
 
-            if direction and entry_price > 0:
-                logger.info(f"🎯 {direction} TRIGGERED! Weight: {round(imbalance,3)} | Price: ${entry_price}")
+            if direction:
+                logger.info(f"🎯 SNIPER {direction} | Imbalance: {round(imb,3)} | Price: ${current_price}")
                 
-                # Wait 5 seconds for the market to move (Trade Lock Time)
-                await asyncio.sleep(5) 
+                # The Patient Wait (60 seconds)
+                await asyncio.sleep(CONFIG["TRADE_DURATION"])
                 
-                # Check price again after the wait
                 _, exit_price = await self.get_market_data()
                 
-                # Calculate real PnL (including the hidden 0.1% convert spread)
+                # Math: (Price Move) - (Entry Fee + Exit Fee)
                 if direction == "BUY":
-                    price_change = (exit_price - entry_price) / entry_price
+                    move = (exit_price - current_price) / current_price
                 else:
-                    price_change = (entry_price - exit_price) / entry_price
+                    move = (current_price - exit_price) / current_price
                 
-                # Net Profit = (Price Move %) - (Convert Fee %)
-                net_profit_pct = price_change - CONFIG["CONVERT_SPREAD"]
-                real_pnl = CONFIG["TRADE_SIZE_USD"] * net_profit_pct
+                # Subtract spread (0.1%)
+                net_move = move - CONFIG["CONVERT_SPREAD"]
+                pnl = CONFIG["TRADE_SIZE_USD"] * net_move
+                self.shadow_balance += pnl
                 
-                self.shadow_balance += real_pnl
-                
-                outcome = "✅ WIN" if real_pnl > 0 else "❌ LOSS"
-                logger.info(f"{outcome} | Move: {round(price_change*100, 4)}% | Net PnL: ${round(real_pnl, 4)}")
-                logger.info(f"💰 Real Shadow Balance: ${round(self.shadow_balance, 3)}")
-
+                status = "💰 WIN" if pnl > 0 else "💀 LOSS"
+                logger.info(f"{status} | Move: {round(move*100,3)}% | Net PnL: ${round(pnl,4)}")
+                logger.info(f"🏦 New Balance: ${round(self.shadow_balance, 3)}")
+            
             await asyncio.sleep(CONFIG["POLL_SPEED"])
 
 if __name__ == "__main__":
-    asyncio.run(WeightWatcherMaster().run())
+    asyncio.run(SniperBot().run())
