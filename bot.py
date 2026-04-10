@@ -1,105 +1,133 @@
 import asyncio
 import logging
 import aiohttp
+import feedparser
 import time
-import math
 from decimal import Decimal
-from collections import deque
 
-# OPTIMIZED CONFIG FOR $3 BALANCE / $0.30 TRADE SIZE
+# --- REAL-WORLD CONFIGURATION ---
 CONFIG = {
     "SYMBOL": "BTCUSDT",
-    "TRADE_SIZE": Decimal("0.30"),
-    "IMB_THRESHOLD": Decimal("0.65"),
-    "VOL_MIN": Decimal("0.0001"),
-    "TP": Decimal("0.0187"),
-    "SL": Decimal("0.0080"),
-    "FEE": Decimal("0.001"),
-    "MAX_HOLD": 300,
-    "POLL": 0.2,
+    "TRADE_SIZE": Decimal("1.00"),    # USD size
+    "BASE_IMB_THRESH": Decimal("0.35"),# 35% Weight difference
+    "DEPTH": 20,
+    "POLL_SPEED": 0.3,                 # 300ms for faster reaction
+    "TP": Decimal("0.0050"),           # 0.50% Actual Move (Realistic for scalping)
+    "SL": Decimal("0.0025"),           # 0.25% Stop Loss
+    "FEE": Decimal("0.001"),           # 0.1% Binance Fee
+    "NEWS_FEEDS": [
+        "https://cointelegraph.com/rss",
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cryptopanic.com/news/rss/"
+    ]
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-log = logging.getLogger("SniperV24-PRO")
+log = logging.getLogger("V25-SENTINEL")
 
-class SniperV24:
+class WeightWatcherSentinel:
     def __init__(self):
-        self.balance = Decimal("3.00")
-        self.price_hist = deque(maxlen=20)
-        self.last_trade = 0
-        self.base_url = "https://api.binance.com/api/v3/depth"
+        self.balance = Decimal("10.00")
+        self.news_multiplier = Decimal("1.0")
+        self.hot_keywords = ["BREAKING", "CRASH", "SEC", "LIQUIDATION", "PUMP", "SURGE", "ETF"]
+        self.last_news_check = 0
 
-    async def get_imbalance(self, session):
-        """Fetches order book and calculates the bid/ask imbalance."""
+    # --- NEWS SCANNER (Sensitivity Booster) ---
+    async def scan_news(self, session):
+        while True:
+            try:
+                found_heat = False
+                for url in CONFIG["NEWS_FEEDS"]:
+                    async with session.get(url, timeout=5) as resp:
+                        content = await resp.text()
+                        feed = feedparser.parse(content)
+                        for entry in feed.entries[:5]:
+                            if any(word in entry.title.upper() for word in self.hot_keywords):
+                                found_heat = True
+                                break
+                
+                self.news_multiplier = Decimal("0.6") if found_heat else Decimal("1.0")
+                if found_heat:
+                    log.info("📡 NEWS ALERT: Market Heat Detected. Lowering Entry Bar.")
+            except Exception as e:
+                log.debug(f"News fetch error: {e}")
+            await asyncio.sleep(60)
+
+    # --- ORDER BOOK & PRICE ENGINE ---
+    async def get_market_data(self, session):
         try:
-            params = {"symbol": CONFIG["SYMBOL"], "limit": 10}
-            async with session.get(self.base_url, params=params) as resp:
-                data = await resp.json()
+            url = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['SYMBOL']}&limit={CONFIG['DEPTH']}"
+            async with session.get(url, timeout=1) as resp:
+                res = await resp.json()
                 
-                # Fetching best bid and best ask to calculate mid price
-                best_bid = Decimal(data['bids'][0][0])
-                best_ask = Decimal(data['asks'][0][0])
-                mid_price = (best_bid + best_ask) / 2
-
-                # Calculate total volume for top 10 levels
-                bids_vol = sum(Decimal(b[1]) for b in data['bids'])
-                asks_vol = sum(Decimal(a[1]) for a in data['asks'])
-                total = bids_vol + asks_vol
+                # Best Bid/Ask for Mid Price
+                bid_price = Decimal(res['bids'][0][0])
+                ask_price = Decimal(res['asks'][0][0])
+                mid_price = (bid_price + ask_price) / 2
                 
-                imbalance = (bids_vol / total) if total > 0 else Decimal("0.5")
+                # Weight calculation
+                bid_weight = sum(Decimal(b[0]) * Decimal(b[1]) for b in res['bids'])
+                ask_weight = sum(Decimal(a[0]) * Decimal(a[1]) for a in res['asks'])
+                
+                imbalance = (bid_weight - ask_weight) / (bid_weight + ask_weight)
                 return imbalance, mid_price
-        except Exception as e:
-            log.error(f"Fetch Error: {e}")
+        except:
             return None, None
 
     async def run(self):
-        log.info(f"Starting SniperV24 on {CONFIG['SYMBOL']} with ${CONFIG['TRADE_SIZE']} trades...")
+        log.info(f"⚖️ V25 SENTINEL ONLINE | Live Conditions Enabled | Bal: ${self.balance}")
+        
         async with aiohttp.ClientSession() as session:
+            # Start News Task
+            asyncio.create_task(self.scan_news(session))
+            
             while True:
-                try:
-                    # 1. Check for Imbalance
-                    imbalance, price = await self.get_imbalance(session)
-                    if imbalance is None:
-                        continue
+                imb, price = await self.get_market_data(session)
+                if imb is None: continue
+                
+                dynamic_thresh = CONFIG["BASE_IMB_THRESH"] * self.news_multiplier
+                
+                direction = None
+                if imb > dynamic_thresh: direction = "BUY"
+                elif imb < -dynamic_thresh: direction = "SELL"
+                
+                if direction:
+                    entry_price = price
+                    log.info(f"🚀 ENTRY {direction} @ {entry_price} | Imb: {round(imb,3)}")
+                    
+                    # --- LIVE POSITION TRACKING ---
+                    start_time = time.time()
+                    while True:
+                        _, current_price = await self.get_market_data(session)
+                        if current_price is None: continue
                         
-                    self.price_hist.append(price)
-
-                    # 2. Entry Logic: If bid volume > threshold, go Long
-                    if imbalance > CONFIG["IMB_THRESHOLD"]:
-                        entry_price = price
-                        tp_price = entry_price * (1 + CONFIG["TP"])
-                        sl_price = entry_price * (1 - CONFIG["SL"])
-                        
-                        log.info(f"🚀 BUY at {entry_price} | Imbalance: {imbalance:.2f}")
-                        log.info(f"🎯 Targets: TP {tp_price:.2f} | SL {sl_price:.2f}")
-
-                        # 3. Trade Monitoring Loop
-                        start_time = time.time()
-                        while time.time() - start_time < CONFIG["MAX_HOLD"]:
-                            await asyncio.sleep(CONFIG["POLL"])
-                            _, current_price = await self.get_imbalance(session)
+                        # Calculate Profit/Loss based on direction
+                        if direction == "BUY":
+                            move = (current_price - entry_price) / entry_price
+                        else:
+                            move = (entry_price - current_price) / entry_price
                             
-                            if current_price is None:
-                                continue
+                        # Exit Checks
+                        if move >= CONFIG["TP"]:
+                            net_pnl = CONFIG["TRADE_SIZE"] * (move - (CONFIG["FEE"] * 2))
+                            self.balance += net_pnl
+                            log.info(f"✅ TAKE PROFIT | Move: {round(move*100,2)}% | Net: ${round(net_pnl,4)} | Bal: ${round(self.balance,3)}")
+                            break
+                        
+                        if move <= -CONFIG["SL"]:
+                            net_pnl = CONFIG["TRADE_SIZE"] * (move - (CONFIG["FEE"] * 2))
+                            self.balance += net_pnl
+                            log.info(f"❌ STOP LOSS | Move: {round(move*100,2)}% | Net: ${round(net_pnl,4)} | Bal: ${round(self.balance,3)}")
+                            break
+                            
+                        # Safety Timeout (10 minutes)
+                        if time.time() - start_time > 600:
+                            log.info("⌛ Trade Timed Out. Exiting at Mid-Market.")
+                            break
+                            
+                        await asyncio.sleep(0.3)
 
-                            if current_price >= tp_price:
-                                profit = (CONFIG["TRADE_SIZE"] * CONFIG["TP"]) - (CONFIG["TRADE_SIZE"] * CONFIG["FEE"] * 2)
-                                self.balance += profit
-                                log.info(f"💰 TAKE PROFIT! Net: +${profit:.4f} | New Bal: ${self.balance:.4f}")
-                                break
-                                
-                            elif current_price <= sl_price:
-                                loss = (CONFIG["TRADE_SIZE"] * CONFIG["SL"]) + (CONFIG["TRADE_SIZE"] * CONFIG["FEE"] * 2)
-                                self.balance -= loss
-                                log.info(f"💀 STOP LOSS HIT. Net: -${loss:.4f} | New Bal: ${self.balance:.4f}")
-                                break
-
-                    await asyncio.sleep(CONFIG["POLL"])
-
-                except Exception as e:
-                    log.error(f"Loop Error: {e}")
-                    await asyncio.sleep(1)
+                await asyncio.sleep(CONFIG["POLL_SPEED"])
 
 if __name__ == "__main__":
-    bot = SniperV24()
-    asyncio.run(bot.run())
+    asyncio.run(WeightWatcherSentinel().run())
