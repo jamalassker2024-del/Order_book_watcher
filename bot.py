@@ -7,40 +7,41 @@ import sys
 from decimal import Decimal
 from collections import deque
 
-# --- V17.0 CITADEL CONFIG ---
+# --- V18.0 IRON GRID CONFIG ---
 CONFIG = {
     "SYMBOL": "btcusdt",
     "TRADE_SIZE_USD": Decimal("50.0"),
     
-    # ANTI-NOISE TACTICS
-    "IMB_THRESHOLD": Decimal("0.075"),   # 7.5% - Only whales allowed
-    "CONFIRM_SNAPSHOTS": 5,              # Must stay imbalanced for 500ms (5 snapshots)
+    # HEDGING STRATEGY
+    "IMB_THRESHOLD": Decimal("0.055"),   # Lowered slightly to allow hedge entries
+    "CONFIRM_SNAPSHOTS": 4,              # 400ms confirmation
     "LEVELS": 20,
     
-    # PROFIT OPTIMIZATION
-    "FEE": Decimal("0.0006"),            
-    "TARGET_PROFIT": Decimal("0.0022"),  # Higher target for higher win-rate quality
-    "STOP_LOSS": Decimal("-0.0030"),     
-    "BE_ACTIVATION": Decimal("0.0011"),  # If price moves +0.11%, move SL to entry
+    # DIRECTIONAL LIMITS (The Hedge)
+    "MAX_TOTAL_TRADES": 16,              
+    "MAX_SIDE_EXPOSURE": 10,             # Never more than 10 of ONE side (Buy or Sell)
     
-    # AGGRESSIVE INVENTORY
-    "MAX_TRADES": 12,                    
-    "MIN_PRICE_DIFF": Decimal("15.0"),   # Force trades to be spread out ($15 gap)
-    "MAX_TRADE_AGE_SEC": 480             # 8 min flush
+    # FINANCIALS
+    "FEE": Decimal("0.0006"),            
+    "TARGET_PROFIT": Decimal("0.0020"),  
+    "STOP_LOSS": Decimal("-0.0045"),     # Wider SL because the Hedge absorbs the hit
+    "BE_ACTIVATION": Decimal("0.0012"),  
+    
+    "MIN_PRICE_DIFF": Decimal("12.0"),   
+    "MAX_TRADE_AGE_SEC": 600             
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
-log = logging.getLogger("CITADEL")
+log = logging.getLogger("IRON_GRID")
 
-class BTCOrderFlowBot:
+class BTCHedgedBot:
     def __init__(self):
         self.balance = Decimal("1000.00")
         self.trades = []
-        # Store recent imbalances to filter noise
         self.imb_stream = deque(maxlen=CONFIG["CONFIRM_SNAPSHOTS"])
-        self.last_entry_price = Decimal("0")
+        self.last_buy_price = Decimal("0")
+        self.last_sell_price = Decimal("0")
         self.msg_count = 0
-        self.start_time = time.time()
 
     def calc_imbalance(self, bids, asks):
         b_vol = sum(Decimal(b[1]) for b in bids)
@@ -50,7 +51,7 @@ class BTCOrderFlowBot:
 
     async def run(self):
         url = f"wss://stream.binance.com:9443/ws/{CONFIG['SYMBOL']}@depth20@100ms"
-        log.info(f"🛡️ CITADEL ENGINE ACTIVE | {CONFIG['SYMBOL'].upper()}")
+        log.info(f"⚔️ IRON GRID HEDGE ACTIVE | {CONFIG['SYMBOL'].upper()}")
         
         async with websockets.connect(url) as ws:
             while True:
@@ -65,73 +66,69 @@ class BTCOrderFlowBot:
                     self.imb_stream.append(imb)
                     now = time.time()
 
-                    # --- HEARTBEAT ---
+                    # --- STATUS UPDATE ---
                     self.msg_count += 1
                     if self.msg_count % 100 == 0:
-                        avg_imb = sum(self.imb_stream)/len(self.imb_stream) if self.imb_stream else 0
-                        log.info(f"📊 [LIVE] {len(self.trades)} Active | Bal: ${round(self.balance, 2)} | AvgImb: {round(avg_imb,3)}")
+                        buys = len([t for t in self.trades if t['side'] == "BUY"])
+                        sells = len([t for t in self.trades if t['side'] == "SELL"])
+                        log.info(f"📊 [HEDGE] B:{buys} | S:{sells} | Bal: ${round(self.balance, 2)} | P: {bid_p}")
                         sys.stdout.flush()
 
-                    # --- SMART TACTIC: SUSTAINED PRESSURE ENTRY ---
+                    # --- HEDGED ENTRY LOGIC ---
                     if len(self.imb_stream) == CONFIG["CONFIRM_SNAPSHOTS"]:
                         avg_imb = sum(self.imb_stream) / len(self.imb_stream)
+                        side = "BUY" if avg_imb > CONFIG["IMB_THRESHOLD"] else "SELL" if avg_imb < -CONFIG["IMB_THRESHOLD"] else None
                         
-                        # Only trade if the AVERAGE imbalance is strong (filters one-off noise)
-                        if (abs(avg_imb) > CONFIG["IMB_THRESHOLD"] and 
-                            len(self.trades) < CONFIG["MAX_TRADES"] and 
-                            abs(ask_p - self.last_entry_price) > CONFIG["MIN_PRICE_DIFF"]):
-                            
-                            side = "BUY" if avg_imb > 0 else "SELL"
-                            entry = ask_p if side == "BUY" else bid_p
-                            self.trades.append({
-                                "side": side, 
-                                "entry": entry, 
-                                "time": now, 
-                                "sl": CONFIG["STOP_LOSS"],
-                                "protected": False 
-                            })
-                            self.last_entry_price = entry
-                            log.info(f"🚀 {side} ENTER | Confirmed Imb: {round(avg_imb,3)} | P: {entry}")
-                            sys.stdout.flush()
+                        if side:
+                            current_side_count = len([t for t in self.trades if t['side'] == side])
+                            last_p = self.last_buy_price if side == "BUY" else self.last_sell_price
+                            entry_p = ask_p if side == "BUY" else bid_p
 
-                    # --- SMART TACTIC: DYNAMIC PROTECTION ---
+                            # Check exposure and price distance for this specific side
+                            if (current_side_count < CONFIG["MAX_SIDE_EXPOSURE"] and 
+                                len(self.trades) < CONFIG["MAX_TOTAL_TRADES"] and
+                                abs(entry_p - last_p) > CONFIG["MIN_PRICE_DIFF"]):
+                                
+                                self.trades.append({
+                                    "side": side, "entry": entry_p, "time": now, "protected": False
+                                })
+                                if side == "BUY": self.last_buy_price = entry_p
+                                else: self.last_sell_price = entry_p
+                                
+                                log.info(f"🚀 OPEN {side} | P: {entry_p} | Imb: {round(avg_imb,3)}")
+                                sys.stdout.flush()
+
+                    # --- MANAGEMENT ---
                     open_trades = []
                     for t in self.trades:
                         current = bid_p if t['side'] == "BUY" else ask_p
                         move = (current - t['entry']) / t['entry'] if t['side'] == "BUY" else (t['entry'] - current) / t['entry']
                         net = move - (CONFIG["FEE"] * 2)
                         
-                        # Break-even switch: If we are deep in profit, lock the floor at 0.01% profit
-                        if net >= CONFIG["BE_ACTIVATION"]:
-                            t["protected"] = True
+                        if net >= CONFIG["BE_ACTIVATION"]: t["protected"] = True
 
-                        # Exit conditions
                         exit_now = False
                         reason = ""
 
-                        if net >= CONFIG["TARGET_PROFIT"]:
-                            exit_now, reason = True, "💰 WIN"
-                        elif t["protected"] and net < Decimal("0.0001"):
-                            exit_now, reason = True, "🛡️ GUARD" # Saved a winner from becoming a loser
-                        elif net <= t["sl"]:
-                            exit_now, reason = True, "❌ SL"
-                        elif (now - t['time']) > CONFIG["MAX_TRADE_AGE_SEC"]:
-                            exit_now, reason = True, "⏰ TIME"
+                        if net >= CONFIG["TARGET_PROFIT"]: exit_now, reason = True, "💰 WIN"
+                        elif t["protected"] and net < Decimal("0.0001"): exit_now, reason = True, "🛡️ HEDGE_GUARD"
+                        elif net <= CONFIG["STOP_LOSS"]: exit_now, reason = True, "❌ SL"
+                        elif (now - t['time']) > CONFIG["MAX_TRADE_AGE_SEC"]: exit_now, reason = True, "⏰ TIME"
 
                         if exit_now:
                             pnl = CONFIG["TRADE_SIZE_USD"] * net
                             self.balance += pnl
-                            log.info(f"{reason} | Net: {round(net*100,4)}% | Bal: ${round(self.balance, 2)}")
+                            log.info(f"{reason} {t['side']} | Net: {round(net*100,4)}% | Bal: ${round(self.balance, 2)}")
                             sys.stdout.flush()
                         else:
                             open_trades.append(t)
                     self.trades = open_trades
 
-                except Exception as e:
+                except Exception:
                     break
 
 if __name__ == "__main__":
-    bot = BTCOrderFlowBot()
+    bot = BTCHedgedBot()
     while True:
         try: asyncio.run(bot.run())
         except: time.sleep(1)
