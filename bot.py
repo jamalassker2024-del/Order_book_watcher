@@ -7,34 +7,37 @@ import sys
 from decimal import Decimal
 from collections import deque
 
-# --- V16.0 PROFIT SHIELD CONFIG ---
+# --- V17.0 CITADEL CONFIG ---
 CONFIG = {
     "SYMBOL": "btcusdt",
     "TRADE_SIZE_USD": Decimal("50.0"),
     
-    # Strictly follow high-conviction "Whale" walls
-    "IMB_THRESHOLD": Decimal("0.06"),    # Increased to 6% (Wait for real pressure)
+    # ANTI-NOISE TACTICS
+    "IMB_THRESHOLD": Decimal("0.075"),   # 7.5% - Only whales allowed
+    "CONFIRM_SNAPSHOTS": 5,              # Must stay imbalanced for 500ms (5 snapshots)
     "LEVELS": 20,
     
-    # Financials - Giving the "Wiggle" Room
+    # PROFIT OPTIMIZATION
     "FEE": Decimal("0.0006"),            
-    "TARGET_PROFIT": Decimal("0.0015"),  # Aim for 0.15% (Approx $110 move)
-    "STOP_LOSS": Decimal("-0.0035"),     # Wider SL (0.35%) to survive BTC noise
+    "TARGET_PROFIT": Decimal("0.0022"),  # Higher target for higher win-rate quality
+    "STOP_LOSS": Decimal("-0.0030"),     
+    "BE_ACTIVATION": Decimal("0.0011"),  # If price moves +0.11%, move SL to entry
     
-    # Inventory Management
-    "MAX_TRADES": 10,                    # Focus on fewer, higher-quality trades
-    "MIN_PRICE_DIFF": Decimal("10.0"),   # Spread entries by at least $10
-    "MAX_TRADE_AGE_SEC": 600             # 10 min max hold
+    # AGGRESSIVE INVENTORY
+    "MAX_TRADES": 12,                    
+    "MIN_PRICE_DIFF": Decimal("15.0"),   # Force trades to be spread out ($15 gap)
+    "MAX_TRADE_AGE_SEC": 480             # 8 min flush
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
-log = logging.getLogger("PROFIT_SHIELD")
+log = logging.getLogger("CITADEL")
 
 class BTCOrderFlowBot:
     def __init__(self):
         self.balance = Decimal("1000.00")
         self.trades = []
-        self.imb_history = deque(maxlen=10)
+        # Store recent imbalances to filter noise
+        self.imb_stream = deque(maxlen=CONFIG["CONFIRM_SNAPSHOTS"])
         self.last_entry_price = Decimal("0")
         self.msg_count = 0
         self.start_time = time.time()
@@ -47,51 +50,78 @@ class BTCOrderFlowBot:
 
     async def run(self):
         url = f"wss://stream.binance.com:9443/ws/{CONFIG['SYMBOL']}@depth20@100ms"
-        log.info(f"🛰️ PROFIT SHIELD ACTIVE | {CONFIG['SYMBOL'].upper()}")
+        log.info(f"🛡️ CITADEL ENGINE ACTIVE | {CONFIG['SYMBOL'].upper()}")
         
         async with websockets.connect(url) as ws:
             while True:
                 try:
                     raw_data = await asyncio.wait_for(ws.recv(), timeout=15)
                     data = json.loads(raw_data)
-                    bids, asks = data.get("bids", data.get("b", [])), data.get("asks", data.get("a", []))
+                    bids, asks = data.get("bids", []), data.get("asks", [])
                     if not bids or not asks: continue
 
                     bid_p, ask_p = Decimal(bids[0][0]), Decimal(asks[0][0])
                     imb = self.calc_imbalance(bids, asks)
+                    self.imb_stream.append(imb)
                     now = time.time()
 
                     # --- HEARTBEAT ---
                     self.msg_count += 1
-                    if self.msg_count % 150 == 0:
-                        log.info(f"📊 [STATUS] {len(self.trades)} Active | Bal: ${round(self.balance, 2)} | Price: {bid_p}")
+                    if self.msg_count % 100 == 0:
+                        avg_imb = sum(self.imb_stream)/len(self.imb_stream) if self.imb_stream else 0
+                        log.info(f"📊 [LIVE] {len(self.trades)} Active | Bal: ${round(self.balance, 2)} | AvgImb: {round(avg_imb,3)}")
                         sys.stdout.flush()
 
-                    # --- SMART ENTRY (High Conviction Only) ---
-                    price_dist = abs(ask_p - self.last_entry_price)
-                    if (abs(imb) > CONFIG["IMB_THRESHOLD"] and 
-                        len(self.trades) < CONFIG["MAX_TRADES"] and 
-                        price_dist > CONFIG["MIN_PRICE_DIFF"]):
+                    # --- SMART TACTIC: SUSTAINED PRESSURE ENTRY ---
+                    if len(self.imb_stream) == CONFIG["CONFIRM_SNAPSHOTS"]:
+                        avg_imb = sum(self.imb_stream) / len(self.imb_stream)
                         
-                        side = "BUY" if imb > 0 else "SELL"
-                        entry = ask_p if side == "BUY" else bid_p
-                        self.trades.append({"side": side, "entry": entry, "time": now})
-                        self.last_entry_price = entry
-                        log.info(f"🚀 {side} EXEC | Imb: {round(imb,3)} | P: {entry}")
-                        sys.stdout.flush()
+                        # Only trade if the AVERAGE imbalance is strong (filters one-off noise)
+                        if (abs(avg_imb) > CONFIG["IMB_THRESHOLD"] and 
+                            len(self.trades) < CONFIG["MAX_TRADES"] and 
+                            abs(ask_p - self.last_entry_price) > CONFIG["MIN_PRICE_DIFF"]):
+                            
+                            side = "BUY" if avg_imb > 0 else "SELL"
+                            entry = ask_p if side == "BUY" else bid_p
+                            self.trades.append({
+                                "side": side, 
+                                "entry": entry, 
+                                "time": now, 
+                                "sl": CONFIG["STOP_LOSS"],
+                                "protected": False 
+                            })
+                            self.last_entry_price = entry
+                            log.info(f"🚀 {side} ENTER | Confirmed Imb: {round(avg_imb,3)} | P: {entry}")
+                            sys.stdout.flush()
 
-                    # --- MANAGEMENT ---
+                    # --- SMART TACTIC: DYNAMIC PROTECTION ---
                     open_trades = []
                     for t in self.trades:
                         current = bid_p if t['side'] == "BUY" else ask_p
                         move = (current - t['entry']) / t['entry'] if t['side'] == "BUY" else (t['entry'] - current) / t['entry']
                         net = move - (CONFIG["FEE"] * 2)
                         
-                        if net >= CONFIG["TARGET_PROFIT"] or net <= CONFIG["STOP_LOSS"] or (now - t['time']) > CONFIG["MAX_TRADE_AGE_SEC"]:
-                            reason = "💰 WIN" if net >= CONFIG["TARGET_PROFIT"] else "❌ SL" if net <= CONFIG["STOP_LOSS"] else "⏰ TIME"
+                        # Break-even switch: If we are deep in profit, lock the floor at 0.01% profit
+                        if net >= CONFIG["BE_ACTIVATION"]:
+                            t["protected"] = True
+
+                        # Exit conditions
+                        exit_now = False
+                        reason = ""
+
+                        if net >= CONFIG["TARGET_PROFIT"]:
+                            exit_now, reason = True, "💰 WIN"
+                        elif t["protected"] and net < Decimal("0.0001"):
+                            exit_now, reason = True, "🛡️ GUARD" # Saved a winner from becoming a loser
+                        elif net <= t["sl"]:
+                            exit_now, reason = True, "❌ SL"
+                        elif (now - t['time']) > CONFIG["MAX_TRADE_AGE_SEC"]:
+                            exit_now, reason = True, "⏰ TIME"
+
+                        if exit_now:
                             pnl = CONFIG["TRADE_SIZE_USD"] * net
                             self.balance += pnl
-                            log.info(f"{reason} | Net: {round(net*100,4)}% | PnL: ${round(pnl,3)} | Bal: ${round(self.balance, 2)}")
+                            log.info(f"{reason} | Net: {round(net*100,4)}% | Bal: ${round(self.balance, 2)}")
                             sys.stdout.flush()
                         else:
                             open_trades.append(t)
@@ -104,4 +134,4 @@ if __name__ == "__main__":
     bot = BTCOrderFlowBot()
     while True:
         try: asyncio.run(bot.run())
-        except: time.sleep(2)
+        except: time.sleep(1)
