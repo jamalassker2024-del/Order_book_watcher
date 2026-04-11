@@ -6,23 +6,23 @@ from decimal import Decimal
 from collections import deque
 import time
 
-# --- CONFIGURATION (Full Professional Settings) ---
+# --- CONFIGURATION (Optimized for SOLUSDT 2026) ---
 CONFIG = {
-    "SYMBOL": "pepeusdt",
-    "TRADE_SIZE_USD": Decimal("10.0"), # $10 demo trades
+    "SYMBOL": "solusdt",
+    "TRADE_SIZE_USD": Decimal("20.0"), 
 
     "LEVELS": 10,                 
-    "IMB_THRESHOLD": Decimal("0.20"),  # Slightly tighter for quality
-    "DELTA_THRESHOLD": Decimal("0.08"), 
+    "IMB_THRESHOLD": Decimal("0.12"),  # Lowered from 0.20 to be more active
+    "DELTA_THRESHOLD": Decimal("0.04"), # Lowered from 0.08 to catch moves faster
 
     "MAX_TRADES": 5,
-    "FEE": Decimal("0.001"),          # 0.1% (Standard Taker Fee)
-    "COOLDOWN": 2.0,                  
-    "MIN_PROFIT_MULTIPLIER": 1.5      # TP must be 1.5x the Spread
+    "FEE": Decimal("0.001"),          
+    "COOLDOWN": 1.5,                  
+    "MIN_PROFIT_MULTIPLIER": 1.2      # Catch smaller, more frequent wins
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
-log = logging.getLogger("PRO_DEMO")
+log = logging.getLogger("SOL_ACTIVE")
 
 class Trade:
     def __init__(self, side, entry_vamp, spread):
@@ -31,32 +31,30 @@ class Trade:
         self.spread = spread
         self.time = time.time()
 
-class ProOrderFlowBot:
+class ActiveOrderFlowBot:
     def __init__(self):
-        self.balance = Decimal("100.00") # Start with $100 Demo
+        self.balance = Decimal("100.00") 
         self.trades = []
-        self.imb_history = deque(maxlen=10) # 1-second memory (100ms * 10)
+        self.imb_history = deque(maxlen=8) # Faster 0.8s memory
         self.last_entry = 0
 
     def get_vamp(self, levels):
-        """Calculates Volume Adjusted Mid Price (Simulates Real Execution)"""
         total_bid_vol = sum(Decimal(b[1]) for b in levels['bids'])
         total_ask_vol = sum(Decimal(a[1]) for a in levels['asks'])
-        
-        # Effective Price = (Price * Vol) / Total Vol
         avg_bid = sum(Decimal(b[0]) * Decimal(b[1]) for b in levels['bids']) / total_bid_vol
         avg_ask = sum(Decimal(a[0]) * Decimal(a[1]) for a in levels['asks']) / total_ask_vol
-        
         return avg_bid, avg_ask, (avg_ask - avg_bid)
 
     def calc_imbalance(self, bids, asks):
+        # Weighting by Notional (Price * Quantity)
         bid_notional = sum(Decimal(b[0]) * Decimal(b[1]) for b in bids)
         ask_notional = sum(Decimal(a[0]) * Decimal(a[1]) for a in asks)
         return (bid_notional - ask_notional) / (bid_notional + ask_notional)
 
     async def run(self):
-        url = f"wss://stream.binance.com:9443/ws/{CONFIG['SYMBOL']}@depth{CONFIG['LEVELS']}@100ms"
-        log.info(f"💎 V15.0 PRO DEMO STARTED | Pair: {CONFIG['SYMBOL'].upper()}")
+        # Using @depth20 for better data on high-volume SOL
+        url = f"wss://stream.binance.com:9443/ws/{CONFIG['SYMBOL']}@depth20@100ms"
+        log.info(f"⚡ SOLANA ACTIVE SCALPER STARTING | Target: {CONFIG['SYMBOL'].upper()}")
 
         async with websockets.connect(url) as ws:
             while True:
@@ -64,20 +62,16 @@ class ProOrderFlowBot:
                 bids, asks = data.get("b", []), data.get("a", [])
                 if not bids or not asks: continue
 
-                # 1. Get Realistic Prices (VAMP)
                 v_bid, v_ask, spread = self.get_vamp({'bids': bids, 'asks': asks})
                 
-                # 2. Calculate Imbalance & Acceleration
                 imb = self.calc_imbalance(bids, asks)
                 self.imb_history.append(imb)
-                if len(self.imb_history) < 5: continue
+                if len(self.imb_history) < 3: continue
                 
-                # Delta is the change over the last 0.5s
                 delta = imb - self.imb_history[0]
                 now = time.time()
 
-                # 3. Entry Logic (Filtered for Spoofing)
-                # We check if imbalance is SUSTAINED (avg of history)
+                # Entry Logic
                 avg_imb = sum(self.imb_history) / len(self.imb_history)
 
                 if (abs(avg_imb) > CONFIG["IMB_THRESHOLD"] and 
@@ -86,37 +80,31 @@ class ProOrderFlowBot:
                     now - self.last_entry > CONFIG["COOLDOWN"]):
                     
                     side = "BUY" if avg_imb > 0 else "SELL"
-                    entry = v_ask if side == "BUY" else v_bid # We pay the VAMP price
+                    entry = v_ask if side == "BUY" else v_bid 
 
                     self.trades.append(Trade(side, entry, spread))
                     self.last_entry = now
-                    log.info(f"🚀 {side} Order | VAMP: {entry} | Imb: {round(avg_imb,3)} (Δ:{round(delta,3)})")
+                    log.info(f"🚀 {side} | VAMP: {round(entry,3)} | Imb: {round(avg_imb,3)} | Δ:{round(delta,3)}")
 
-                # 4. Realistic Trade Management
+                # Management Logic
                 still_open = []
                 for t in self.trades:
-                    # Current exit price is the other side's VAMP
                     current_exit = v_bid if t.side == "BUY" else v_ask
-                    
-                    # Move calculation
                     move = (current_exit - t.entry) / t.entry if t.side == "BUY" else (t.entry - current_exit) / t.entry
-                    
-                    # Net Profit minus Fees (0.1% each side)
                     net = move - (CONFIG["FEE"] * 2)
 
-                    # Dynamic TP/SL: Requires more move if spread is wider
+                    # Dynamic TP/SL
                     tp_target = (t.spread / t.entry) * CONFIG["MIN_PROFIT_MULTIPLIER"]
-                    sl_target = -(tp_target) 
+                    sl_target = -(tp_target * Decimal("1.5")) # Slightly wider stop to avoid "whipsaws"
 
                     if net >= tp_target or net <= sl_target:
                         pnl = CONFIG["TRADE_SIZE_USD"] * net
                         self.balance += pnl
-                        status = "💰 WIN" if net > 0 else "❌ LOSS"
-                        log.info(f"{status} {t.side} | Net: {round(net*100,3)}% | Bal: ${round(self.balance, 2)}")
+                        log.info(f"{'💰' if net > 0 else '❌'} {t.side} Done | PnL: {round(net*100,3)}% | Bal: ${round(self.balance, 2)}")
                     else:
                         still_open.append(t)
                 
                 self.trades = still_open
 
 if __name__ == "__main__":
-    asyncio.run(ProOrderFlowBot().run())
+    asyncio.run(ActiveOrderFlowBot().run())
