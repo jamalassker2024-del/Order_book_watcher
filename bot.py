@@ -2,99 +2,91 @@ import asyncio
 import json
 import logging
 import websockets
-import feedparser
-import requests
+import sys
 from decimal import Decimal
 from collections import deque
 import time
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 CONFIG = {
     "SYMBOL": "btcusdt",
-    "TRADE_SIZE_USD": Decimal("20.0"),
-    "BASE_THRESHOLD": Decimal("0.15"),  # 15% imbalance
-    "CONFIRM_SNAPSHOTS": 5,             # 500ms of sustained pressure
-    "NEWS_FEEDS": ["https://cryptopanic.com/news/rss/"],
-    "FEE": Decimal("0.0004"),           # Standard VIP0 Maker/Taker avg
-    "TARGET_PROFIT": Decimal("0.0035"), # 0.35% (Realistic scalp)
+    "TRADE_SIZE_USD": Decimal("100.0"), # Larger size to see the PnL "wiggle"
+    "BASE_THRESHOLD": Decimal("0.18"),
+    "FEE": Decimal("0.0004"),
+    "TARGET_PROFIT": Decimal("0.0040"), # 0.4%
     "STOP_LOSS": Decimal("-0.0060"),    # 0.6%
 }
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-log = logging.getLogger("Sentinel")
-
-class HybridSentinel:
+class SentinelPro:
     def __init__(self):
-        self.balance = Decimal("100.00")
-        self.news_multiplier = Decimal("1.0")
-        self.imb_stream = deque(maxlen=CONFIG["CONFIRM_SNAPSHOTS"])
+        self.balance = Decimal("1000.00")
         self.active_trade = None
-        self.hot_keywords = ["BREAKING", "SEC", "ETF", "PUMP", "DUMP", "LIQUIDATION"]
-
-    # --- NEWS ENGINE (From Strategy 1) ---
-    async def scan_news(self):
-        """Reduces threshold (increases sensitivity) during breaking news"""
-        while True:
-            try:
-                heat = False
-                for url in CONFIG["NEWS_FEEDS"]:
-                    feed = feedparser.parse(url)
-                    for entry in feed.entries[:5]:
-                        if any(w in entry.title.upper() for w in self.hot_keywords):
-                            heat = True; break
-                self.news_multiplier = Decimal("0.6") if heat else Decimal("1.0")
-                if heat: log.info("📡 VOLATILITY ALERT: News is hot. Tightening sensors.")
-            except Exception as e: log.error(f"News Error: {e}")
-            await asyncio.sleep(60)
+        self.imb_stream = deque(maxlen=5)
 
     def get_imbalance(self, bids, asks):
-        """Calculates USD weight imbalance (Price * Quantity)"""
-        bid_weight = sum(Decimal(b[0]) * Decimal(b[1]) for b in bids)
-        ask_weight = sum(Decimal(a[0]) * Decimal(a[1]) for a in asks)
-        return (bid_weight - ask_weight) / (bid_weight + ask_weight)
+        b_w = sum(Decimal(b[0]) * Decimal(b[1]) for b in bids)
+        a_w = sum(Decimal(a[0]) * Decimal(a[1]) for a in asks)
+        return (b_w - a_w) / (b_w + a_w)
 
     async def run(self):
         url = f"wss://stream.binance.com:9443/ws/{CONFIG['SYMBOL']}@depth20@100ms"
-        asyncio.create_task(self.scan_news())
         
         async with websockets.connect(url) as ws:
-            log.info("⚔️ SENTINEL HYBRID ONLINE")
+            print(f"\n--- ⚔️ SENTINEL LIVE TERMINAL ACTIVE [{CONFIG['SYMBOL'].upper()}] ---")
+            
             while True:
                 data = json.loads(await ws.recv())
                 bids, asks = data.get("bids", []), data.get("asks", [])
                 if not bids: continue
 
-                price = Decimal(bids[0][0])
+                # Real-time prices
+                bid_p, ask_p = Decimal(bids[0][0]), Decimal(asks[0][0])
                 current_imb = self.get_imbalance(bids, asks)
                 self.imb_stream.append(current_imb)
 
-                # --- 1. TRADE MANAGEMENT ---
+                # --- LIVE MONITORING (THE WIGGLE) ---
                 if self.active_trade:
                     t = self.active_trade
-                    # Calculate Net ROI
-                    move = (price - t['entry']) / t['entry'] if t['side'] == "BUY" else (t['entry'] - price) / t['entry']
-                    net = move - (CONFIG["FEE"] * 2)
-
-                    if net >= CONFIG["TARGET_PROFIT"] or net <= CONFIG["STOP_LOSS"]:
-                        pnl = CONFIG["TRADE_SIZE_USD"] * net
-                        self.balance += pnl
-                        status = "💰 WIN" if net > 0 else "❌ LOSS"
-                        log.info(f"{status} | Net: {round(net*100,3)}% | New Bal: ${round(self.balance,2)}")
-                        self.active_trade = None
-                        await asyncio.sleep(2) # Cooldown
-
-                # --- 2. ENTRY LOGIC (Weighted & Sustained) ---
-                elif len(self.imb_stream) == CONFIG["CONFIRM_SNAPSHOTS"]:
-                    avg_imb = sum(self.imb_stream) / len(self.imb_stream)
-                    dynamic_thresh = CONFIG["BASE_THRESHOLD"] * self.news_multiplier
+                    # If BUY, profit is when bid goes up. If SELL, profit is when ask goes down.
+                    price_now = bid_p if t['side'] == "BUY" else ask_p
                     
-                    side = None
-                    if avg_imb > dynamic_thresh: side = "BUY"
-                    elif avg_imb < -dynamic_thresh: side = "SELL"
+                    raw_move = (price_now - t['entry']) / t['entry'] if t['side'] == "BUY" else (t['entry'] - price_now) / t['entry']
+                    net_roi = raw_move - (CONFIG["FEE"] * 2)
+                    live_pnl = CONFIG["TRADE_SIZE_USD"] * net_roi
+                    
+                    # Color coding for the terminal
+                    color = "\033[92m" if live_pnl > 0 else "\033[91m" # Green/Red
+                    reset = "\033[0m"
 
-                    if side:
-                        self.active_trade = {"side": side, "entry": price, "time": time.time()}
-                        log.info(f"🚀 {side} ENTRY | Imbalance: {round(avg_imb,3)} | Price: {price}")
+                    # THE "MT4" LIVE ROW
+                    sys.stdout.write(
+                        f"\r 🟢 ACTIVE {t['side']} | Entry: {t['entry']} | "
+                        f"Price: {price_now} | "
+                        f"PnL: {color}${round(live_pnl, 2)}{reset} ({round(net_roi*100, 3)}%)   "
+                    )
+                    sys.stdout.flush()
+
+                    # Exit Logic
+                    if net_roi >= CONFIG["TARGET_PROFIT"] or net_roi <= CONFIG["STOP_LOSS"]:
+                        self.balance += live_pnl
+                        print(f"\n✅ CLOSED | Net: ${round(live_pnl,2)} | New Bal: ${round(self.balance, 2)}\n")
+                        self.active_trade = None
+
+                else:
+                    # --- SCANNING MODE ---
+                    avg_imb = sum(self.imb_stream) / len(self.imb_stream)
+                    sys.stdout.write(f"\r 📡 SCANNING... Imbalance: {round(avg_imb, 3)} | BTC: ${bid_p}   ")
+                    sys.stdout.flush()
+
+                    if len(self.imb_stream) == 5:
+                        side = "BUY" if avg_imb > CONFIG["BASE_THRESHOLD"] else "SELL" if avg_imb < -CONFIG["BASE_THRESHOLD"] else None
+                        if side:
+                            entry_p = ask_p if side == "BUY" else bid_p
+                            self.active_trade = {"side": side, "entry": entry_p}
+                            print(f"\n🚀 {side} ORDER EXECUTED @ {entry_p}")
 
 if __name__ == "__main__":
-    asyncio.run(HybridSentinel().run())
+    try:
+        asyncio.run(SentinelPro().run())
+    except KeyboardInterrupt:
+        print("\nTerminated.")
