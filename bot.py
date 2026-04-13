@@ -1,94 +1,111 @@
 import asyncio
 import json
+import logging
+import requests
+import feedparser
 import sys
-import websockets
 from decimal import Decimal
-from collections import deque
 import time
 
-# --- PRO-GRADE CONFIG ---
+# --- PRODUCTION CONFIG ---
 CONFIG = {
-    "SYMBOL": "btcusdt",
-    "TRADE_SIZE_USD": Decimal("100.0"),
-    "ENTRY_THRESHOLD": Decimal("0.25"),   # Strict entry
-    "VELOCITY_THRESHOLD": Decimal("0.05"), # Must be accelerating
-    "FEE": Decimal("0.0004"),
-    "TARGET_PROFIT": Decimal("0.0025"),  # 0.25% (Faster turnover)
-    "STOP_LOSS": Decimal("-0.0040"),     # 0.40%
-    "MAX_SPREAD": Decimal("0.0002"),     # Don't trade if spread > 0.02%
+    "SYMBOL": "BTCUSDT",
+    "TRADE_SIZE_USD": Decimal("50.0"),  
+    "BASE_THRESHOLD": Decimal("0.22"),   # Only trade on strong imbalance
+    "FEE_RATE": Decimal("0.0004"),       # 0.04% (Binance Futures Maker/Taker avg)
+    "SLIPPAGE_BPS": Decimal("0.0002"),   # 2 basis points expected slippage
+    "TARGET_PROFIT": Decimal("0.0030"),  # 0.3% Realized profit target
+    "STOP_LOSS": Decimal("-0.0050"),     # 0.5% Stop loss
+    "NEWS_FEEDS": ["https://cryptopanic.com/news/rss/"]
 }
 
-class SentinelUltra:
-    def __init__(self):
-        self.balance = Decimal("1000.00")
-        self.active_trade = None
-        self.imb_history = deque(maxlen=3) # Short window for velocity
-        self.last_trade_time = 0
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+log = logging.getLogger("Sentinel")
 
-    def get_weighted_imb(self, bids, asks):
-        # Weighting the top 5 levels much more aggressively (HFT Style)
-        b_w = sum((Decimal(b[0]) * Decimal(b[1])) * (Decimal(1) / (i + 1)) for i, b in enumerate(bids[:10]))
-        a_w = sum((Decimal(a[0]) * Decimal(a[1])) * (Decimal(1) / (i + 1)) for i, a in enumerate(asks[:10]))
-        return (b_w - a_w) / (b_w + a_w)
+class SentinelMaster:
+    def __init__(self):
+        self.balance = Decimal("100.00") # Starting real equity
+        self.active_trade = None
+        self.news_multiplier = Decimal("1.0")
+        self.hot_keywords = ["BREAKING", "SEC", "ETF", "LIQUIDATION", "PUMP", "DUMP"]
+
+    async def scan_news(self):
+        while True:
+            try:
+                heat = False
+                for url in CONFIG["NEWS_FEEDS"]:
+                    feed = feedparser.parse(url)
+                    for entry in feed.entries[:3]:
+                        if any(w in entry.title.upper() for w in self.hot_keywords):
+                            heat = True; break
+                self.news_multiplier = Decimal("0.7") if heat else Decimal("1.0")
+            except: pass
+            await asyncio.sleep(60)
+
+    async def get_market_data(self):
+        """Fetches real-time spread and order book weight"""
+        try:
+            url = f"https://api.binance.com/api/v3/depth?symbol={CONFIG['SYMBOL']}&limit=20"
+            res = requests.get(url, timeout=1).json()
+            
+            bids, asks = res['bids'], res['asks']
+            best_bid, best_ask = Decimal(bids[0][0]), Decimal(asks[0][0])
+            
+            # Weight Calculation (Price * Volume)
+            b_w = sum(Decimal(b[0]) * Decimal(b[1]) for b in bids)
+            a_w = sum(Decimal(a[0]) * Decimal(a[1]) for a in asks)
+            imbalance = (b_w - a_w) / (b_w + a_w)
+            
+            return imbalance, best_bid, best_ask
+        except: return None, None, None
 
     async def run(self):
-        url = f"wss://stream.binance.com:9443/ws/{CONFIG['SYMBOL']}@depth20@100ms"
+        asyncio.create_task(self.scan_news())
+        print(f"\n--- ⚔️ SENTINEL V1 REAL-WORLD ACTIVE ---")
         
-        async with websockets.connect(url) as ws:
-            print(f"\n--- ⚡ SENTINEL ULTRA: VELOCITY SCALPER [{CONFIG['SYMBOL'].upper()}] ---")
-            
-            while True:
-                try:
-                    data = json.loads(await ws.recv())
-                    bids, asks = data.get("bids", []), data.get("asks", [])
-                    if not bids or not asks: continue
+        while True:
+            imb, bid, ask = await self.get_market_data()
+            if imb is None: continue
 
-                    bid_p, ask_p = Decimal(bids[0][0]), Decimal(asks[0][0])
-                    spread = (ask_p - bid_p) / bid_p
-                    
-                    curr_imb = self.get_weighted_imb(bids, asks)
-                    self.imb_history.append(curr_imb)
+            # --- 1. TRADE MANAGEMENT (If Trade is Open) ---
+            if self.active_trade:
+                t = self.active_trade
+                # We exit at Bid if we Bought, and at Ask if we Sold
+                current_p = bid if t['side'] == "BUY" else ask
+                
+                # Math: (Difference / Entry) - (2x Fees) - (Slippage)
+                raw_move = (current_p - t['entry']) / t['entry'] if t['side'] == "BUY" else (t['entry'] - current_p) / t['entry']
+                net_roi = raw_move - (CONFIG["FEE_RATE"] * 2) - CONFIG["SLIPPAGE_BPS"]
+                live_pnl = CONFIG["TRADE_SIZE_USD"] * net_roi
 
-                    # Calculate Velocity (Acceleration of the book)
-                    velocity = curr_imb - self.imb_history[0] if len(self.imb_history) > 1 else 0
+                # Live Terminal Wiggle
+                color = "\033[92m" if live_pnl > 0 else "\033[91m"
+                sys.stdout.write(f"\r 🟢 {t['side']} OPEN | PnL: {color}${round(live_pnl, 2)}\033[0m ({round(net_roi*100, 3)}%) | BTC: {current_p}  ")
+                sys.stdout.flush()
 
-                    if self.active_trade:
-                        t = self.active_trade
-                        price_now = bid_p if t['side'] == "BUY" else ask_p
-                        roi = ((price_now - t['entry']) / t['entry']) if t['side'] == "BUY" else ((t['entry'] - price_now) / t['entry'])
-                        net_roi = roi - (CONFIG["FEE"] * 2)
+                if net_roi >= CONFIG["TARGET_PROFIT"] or net_roi <= CONFIG["STOP_LOSS"]:
+                    self.balance += live_pnl
+                    print(f"\n✅ CLOSED {t['side']} | Net: ${round(live_pnl,2)} | New Bal: ${round(self.balance, 2)}")
+                    self.active_trade = None
+                    await asyncio.sleep(5) # Cooldown to avoid re-entry
 
-                        # EARLY EXIT LOGIC (Micro-scalping)
-                        # If we have any profit and imbalance flips hard, take it and run
-                        flip_signal = (t['side'] == "BUY" and curr_imb < -0.1) or (t['side'] == "SELL" and curr_imb > 0.1)
-                        
-                        sys.stdout.write(f"\r 🟢 {t['side']} | PnL: {round(net_roi*100, 3)}% | Imb: {round(curr_imb, 2)}   ")
-                        sys.stdout.flush()
+            # --- 2. ENTRY LOGIC (If No Trade) ---
+            else:
+                dynamic_thresh = CONFIG["BASE_THRESHOLD"] * self.news_multiplier
+                sys.stdout.write(f"\r 📡 SCANNING... Imb: {round(imb, 3)} | Threshold: {round(dynamic_thresh, 3)}   ")
+                sys.stdout.flush()
 
-                        if net_roi >= CONFIG["TARGET_PROFIT"] or net_roi <= CONFIG["STOP_LOSS"] or (net_roi > 0.0005 and flip_signal):
-                            pnl_usd = CONFIG["TRADE_SIZE_USD"] * net_roi
-                            self.balance += pnl_usd
-                            reason = "TARGET" if net_roi >= CONFIG["TARGET_PROFIT"] else "FLIP" if flip_signal else "STOP"
-                            print(f"\n✅ {reason} EXIT | PnL: ${round(pnl_usd, 2)} | Bal: ${round(self.balance, 2)}\n")
-                            self.active_trade = None
+                if imb > dynamic_thresh:
+                    # Enter at Ask (The price you pay to buy immediately)
+                    self.active_trade = {"side": "BUY", "entry": ask}
+                    print(f"\n🚀 LONG ENTRY @ {ask} (Threshold: {round(dynamic_thresh, 2)})")
+                
+                elif imb < -dynamic_thresh:
+                    # Enter at Bid (The price you get to sell immediately)
+                    self.active_trade = {"side": "SELL", "entry": bid}
+                    print(f"\n🚀 SHORT ENTRY @ {bid} (Threshold: {round(dynamic_thresh, 2)})")
 
-                    else:
-                        # SCANNING FOR ACCELERATION
-                        sys.stdout.write(f"\r 📡 SCANNING | Imb: {round(curr_imb, 2)} | Vel: {round(velocity, 2)} | Spread: {round(spread*100, 4)}%   ")
-                        sys.stdout.flush()
-
-                        if spread <= CONFIG["MAX_SPREAD"]:
-                            # Entry trigger: High Imbalance AND positive velocity
-                            if curr_imb > CONFIG["ENTRY_THRESHOLD"] and velocity > CONFIG["VELOCITY_THRESHOLD"]:
-                                self.active_trade = {"side": "BUY", "entry": ask_p}
-                                print(f"\n🚀 RAPID BUY @ {ask_p} (Vel: {round(velocity, 2)})")
-                            
-                            elif curr_imb < -CONFIG["ENTRY_THRESHOLD"] and velocity < -CONFIG["VELOCITY_THRESHOLD"]:
-                                self.active_trade = {"side": "SELL", "entry": bid_p}
-                                print(f"\n🚀 RAPID SELL @ {bid_p} (Vel: {round(velocity, 2)})")
-
-                except Exception as e:
-                    await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
 if __name__ == "__main__":
-    asyncio.run(SentinelUltra().run())
+    asyncio.run(SentinelMaster().run())
