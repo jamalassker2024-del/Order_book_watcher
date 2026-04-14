@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ULTIMATE LIMIT SCALPER – ORDER FLOW + TRADE TAPE
+ULTIMATE NO‑TIMEOUT SCALPER – OFI + TRADE TAPE, LIMIT ENTRY/TP, TRAILING STOP
 - Binance depth (OFI) + trade stream (taker flow)
 - Limit entry (aggressive maker) + limit TP (0% fees)
 - Trailing stop locks in profit, no timeout
@@ -25,12 +25,12 @@ CONFIG = {
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 5,
     "OFI_THRESHOLD": Decimal("0.55"),
-    "TRADE_IMBALANCE_THRESHOLD": Decimal("0.3"),   # taker buy/sell ratio > 1.3 or < 0.7
+    "TRADE_IMBALANCE_THRESHOLD": Decimal("0.3"),
     "TAKE_PROFIT_BPS": Decimal("2"),               # 0.02% pure profit (0% fee)
-    "STOP_LOSS_BPS": Decimal("4"),                 # 0.04% initial stop loss (market exit)
+    "STOP_LOSS_BPS": Decimal("4"),                 # 0.04% initial stop (market exit)
     "TRAIL_ACTIVATE_BPS": Decimal("1"),            # start trailing after 0.01% profit
     "TRAIL_DISTANCE_BPS": Decimal("1"),            # trail 0.01% behind
-    "ENTRY_TIMEOUT_SEC": 2,                        # cancel limit entry if not filled
+    "ENTRY_TIMEOUT_SEC": 2,                        # cancel unfilled limit entry (not a position timeout)
     "WIN_COOLDOWN_SEC": 1,
     "LOSS_COOLDOWN_SEC": 15,
     "SCAN_INTERVAL_MS": 20,
@@ -44,8 +44,8 @@ MAKER_FEE = Decimal("0")       # limit entry & TP
 
 class UltimateScalper:
     def __init__(self):
-        self.order_books = {}     # symbol -> OrderBook
-        self.trade_flows = {}     # symbol -> TradeFlow
+        self.order_books = {}
+        self.trade_flows = {}
         self.positions = {}
         self.pending_entries = {}
         self.balance = CONFIG["INITIAL_BALANCE"]
@@ -57,7 +57,7 @@ class UltimateScalper:
         self.last_trade_result = {}
         self.running = True
 
-    # ---------- Order Book with OFI ----------
+    # ---------- Order Book ----------
     class OrderBook:
         def __init__(self, symbol):
             self.symbol = symbol
@@ -110,23 +110,21 @@ class UltimateScalper:
             except Exception:
                 return False
 
-    # ---------- Trade Flow (taker buy/sell volume) ----------
+    # ---------- Trade Flow ----------
     class TradeFlow:
         def __init__(self, symbol):
             self.symbol = symbol
             self.buy_volume = Decimal('0')
             self.sell_volume = Decimal('0')
             self.last_reset = time.time()
-            self.window_sec = 1.0    # 1 second window
+            self.window_sec = 1.0
 
         def add_trade(self, is_buyer_maker, qty, price):
-            """is_buyer_maker: True if the buyer is the maker (i.e., seller aggressive) -> sell trade"""
             volume = qty * price
             if is_buyer_maker:
-                self.sell_volume += volume   # aggressive seller
+                self.sell_volume += volume
             else:
-                self.buy_volume += volume    # aggressive buyer
-            # reset window every second
+                self.buy_volume += volume
             now = time.time()
             if now - self.last_reset > self.window_sec:
                 self.buy_volume = Decimal('0')
@@ -164,7 +162,7 @@ class UltimateScalper:
                         if 'p' in data and 'q' in data:
                             price = Decimal(data['p'])
                             qty = Decimal(data['q'])
-                            is_buyer_maker = data.get('m', False)   # True if buyer is maker (aggressive seller)
+                            is_buyer_maker = data.get('m', False)
                             self.trade_flows[symbol].add_trade(is_buyer_maker, qty, price)
             except Exception:
                 await asyncio.sleep(3)
@@ -177,7 +175,6 @@ class UltimateScalper:
             if base <= 0:
                 return
             price = base + book.tick_size()
-            # ensure we don't cross the spread (still maker)
             if price >= book.best_ask():
                 price = book.best_ask() - book.tick_size()
         else:
@@ -206,11 +203,11 @@ class UltimateScalper:
         }
         print(f"📝 LIMIT {side.upper()} Posted: {symbol} @ {price:.8f}")
 
-    # ---------- Position Management with Trailing Stop ----------
+    # ---------- Position Management (No Timeout) ----------
     def check_fills_and_positions(self):
         now = time.time()
 
-        # 1. Check pending entry fills
+        # Check pending entry fills
         for sym in list(self.pending_entries.keys()):
             order = self.pending_entries[sym]
             book = self.order_books[sym]
@@ -228,7 +225,7 @@ class UltimateScalper:
                     'tp': tp_price,
                     'sl': sl_price,
                     'best_price': order['price'],
-                    'trailing': False,          # trailing not yet active
+                    'trailing': False,
                     'time': now
                 }
                 del self.pending_entries[sym]
@@ -237,19 +234,19 @@ class UltimateScalper:
                 del self.pending_entries[sym]
                 print(f"⌛ ENTRY TIMEOUT: {sym} cancelled")
 
-        # 2. Manage open positions with trailing stop
+        # Manage open positions (no timeout – only TP, SL, or trailing)
         for sym, pos in list(self.positions.items()):
             book = self.order_books[sym]
             mid = book.mid_price()
             if mid <= 0:
                 continue
 
-            # Update trailing stop if price moved in our favour
+            # Update trailing stop (only after profit is made)
             if pos['side'] == 'buy':
                 if mid > pos['best_price']:
                     pos['best_price'] = mid
-                    gain = (mid - pos['entry']) / pos['entry'] * 10000  # in bps
-                    if gain >= CONFIG["TRAIL_ACTIVATE_BPS"]:
+                    gain_bps = (mid - pos['entry']) / pos['entry'] * 10000
+                    if gain_bps >= CONFIG["TRAIL_ACTIVATE_BPS"]:
                         pos['trailing'] = True
                     if pos['trailing']:
                         new_sl = mid * (1 - CONFIG["TRAIL_DISTANCE_BPS"]/10000)
@@ -259,8 +256,8 @@ class UltimateScalper:
             else:  # sell
                 if mid < pos['best_price']:
                     pos['best_price'] = mid
-                    gain = (pos['entry'] - mid) / pos['entry'] * 10000
-                    if gain >= CONFIG["TRAIL_ACTIVATE_BPS"]:
+                    gain_bps = (pos['entry'] - mid) / pos['entry'] * 10000
+                    if gain_bps >= CONFIG["TRAIL_ACTIVATE_BPS"]:
                         pos['trailing'] = True
                     if pos['trailing']:
                         new_sl = mid * (1 + CONFIG["TRAIL_DISTANCE_BPS"]/10000)
@@ -268,10 +265,10 @@ class UltimateScalper:
                             pos['sl'] = new_sl
                             print(f"  🔽 Trail {sym}: SL moved to {new_sl:.8f}")
 
-            # Check take-profit (limit exit, 0% fee)
+            # Take-profit (limit exit, 0% fee)
             hit_tp = (pos['side'] == 'buy' and mid >= pos['tp']) or \
                      (pos['side'] == 'sell' and mid <= pos['tp'])
-            # Check stop-loss (market exit, 0.1% fee)
+            # Stop-loss (market exit, 0.1% fee)
             hit_sl = (pos['side'] == 'buy' and mid <= pos['sl']) or \
                      (pos['side'] == 'sell' and mid >= pos['sl'])
 
@@ -284,7 +281,7 @@ class UltimateScalper:
     def close_win(self, sym, price):
         pos = self.positions.pop(sym)
         gross = pos['qty'] * price
-        fee = gross * MAKER_FEE   # 0%
+        fee = gross * MAKER_FEE
         cost = pos['qty'] * pos['entry']
         profit = (gross - cost) - fee
         self.balance += gross - fee
@@ -316,22 +313,19 @@ class UltimateScalper:
         print(f"{'✅' if profit>0 else '❌'} {reason} {sym} | Profit: ${profit:.4f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[sym] = time.time()
 
-    # ---------- Signal: OFI + Trade Tape ----------
+    # ---------- Combined Signal ----------
     def entry_signal(self, sym):
         book = self.order_books[sym]
         ofi = book.get_ofi(CONFIG["DEPTH_LEVELS"])
         trade_imb = self.trade_flows[sym].get_imbalance()
-        # Buy signal: OFI > threshold AND trade_imb > 0.3 (more buy volume)
         if ofi > CONFIG["OFI_THRESHOLD"] and trade_imb > CONFIG["TRADE_IMBALANCE_THRESHOLD"]:
             return 'buy', ofi, trade_imb
-        # Sell signal: OFI < -threshold AND trade_imb < -0.3
         if ofi < -CONFIG["OFI_THRESHOLD"] and trade_imb < -CONFIG["TRADE_IMBALANCE_THRESHOLD"]:
             return 'sell', ofi, trade_imb
         return None, ofi, trade_imb
 
     # ---------- Main Loop ----------
     async def run(self):
-        # Initialise order books and trade flows
         async with aiohttp.ClientSession() as session:
             for sym in CONFIG["SYMBOLS"]:
                 self.order_books[sym] = self.OrderBook(sym)
@@ -341,7 +335,7 @@ class UltimateScalper:
                 asyncio.create_task(self.subscribe_depth(sym))
                 asyncio.create_task(self.subscribe_trade(sym))
 
-        print("\n🚀 ULTIMATE LIMIT SCALPER – OFI + TRADE TAPE")
+        print("\n🚀 ULTIMATE NO‑TIMEOUT SCALPER – OFI + TRADE TAPE")
         print(f"   TP: 0.02% pure profit | SL: 0.04% | Trail: 0.01% after 0.01% gain")
         print(f"   Position: ${CONFIG['ORDER_SIZE_USDT']} | Balance: ${self.balance}\n")
 
@@ -367,7 +361,6 @@ class UltimateScalper:
 
                 self.check_fills_and_positions()
 
-                # Open new positions
                 for sym in CONFIG["SYMBOLS"]:
                     if sym in self.positions or sym in self.pending_entries:
                         continue
