@@ -25,7 +25,7 @@ CONFIG = {
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 8,
-    "OFI_THRESHOLD": Decimal("0.70"),           # Higher threshold – only extreme signals
+    "OFI_THRESHOLD": Decimal("0.50"),           # Higher threshold – only extreme signals
     "TAKE_PROFIT_BPS": Decimal("12"),           # 0.12% gross → 0.02% net after fees
     "STOP_LOSS_BPS": Decimal("8"),              # 0.08% stop loss
     "BREAKEVEN_ACTIVATE_BPS": Decimal("3"),     # Move SL to entry after 0.03% profit
