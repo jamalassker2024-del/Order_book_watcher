@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-INSTITUTIONAL HFT SCALPER – FIXED NEGATIVE EXPECTANCY
-- Limit orders (0% maker fee) instead of market orders
-- Spread filter – warn but don't block (fixed)
-- Breakeven – move SL to entry after 2 bps profit
-- EMA momentum filter – only trade with trend
+INSTITUTIONAL HFT SCALPER – AGGRESSIVE ENTRY (NO BLOCKS)
+- Limit orders (0% maker fee)
+- NO spread filter – enters immediately
+- NO EMA trend filter – enters on any strong OFI
 - All other secret techniques preserved
+- Fast aggressive trading
 """
 
 import asyncio
@@ -29,7 +29,6 @@ CONFIG = {
     "MIN_OFI_THRESHOLD": Decimal("0.30"),
     "TAKE_PROFIT_BPS": Decimal("15"),
     "STOP_LOSS_BPS": Decimal("10"),
-    "MAX_SPREAD_BPS": Decimal("12"),           # Max spread allowed (0.12%) – much looser
     "BREAKEVEN_ACTIVATE_BPS": Decimal("2"),
     "TRAIL_ACTIVATE_BPS": Decimal("5"),
     "TRAIL_DISTANCE_BPS": Decimal("3"),
@@ -37,7 +36,6 @@ CONFIG = {
     "LOSS_COOLDOWN_SEC": 10,
     "SCAN_INTERVAL_MS": 5,
     "REFRESH_BOOK_SEC": 20,
-    "EMA_PERIOD": 50,
     "BINANCE_WS_DEPTH": "wss://stream.binance.com:9443/ws",
     "BINANCE_WS_TRADE": "wss://stream.binance.com:9443/ws",
 }
@@ -59,7 +57,6 @@ class InstitutionalScalper:
         self.last_trade_result = {}
         self.running = True
         self.price_history = {sym: deque(maxlen=200) for sym in CONFIG["SYMBOLS"]}
-        self.ema = {sym: Decimal('0') for sym in CONFIG["SYMBOLS"]}
         self.iceberg_hits = {sym: {} for sym in CONFIG["SYMBOLS"]}
         self.spoof_candidates = {sym: {} for sym in CONFIG["SYMBOLS"]}
 
@@ -91,12 +88,6 @@ class InstitutionalScalper:
         def mid_price(self):
             bb, ba = self.best_bid(), self.best_ask()
             return (bb + ba) / 2 if bb and ba else Decimal('0')
-
-        def spread_bps(self):
-            spread = self.best_ask() - self.best_bid()
-            if self.best_bid() > 0:
-                return spread / self.best_bid() * 10000
-            return Decimal('999')
 
         def get_volume_weighted_ofi(self, depth=8):
             sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:depth]
@@ -207,26 +198,8 @@ class InstitutionalScalper:
                             is_buyer_maker = data.get('m', False)
                             self.trade_flows[symbol].add_trade(is_buyer_maker, qty, price)
                             self.price_history[symbol].append(price)
-                            self.update_ema(symbol, price)
             except Exception:
                 await asyncio.sleep(3)
-
-    def update_ema(self, symbol, price):
-        if self.ema[symbol] == 0:
-            self.ema[symbol] = price
-        else:
-            multiplier = Decimal('2') / (CONFIG["EMA_PERIOD"] + 1)
-            self.ema[symbol] = (price - self.ema[symbol]) * multiplier + self.ema[symbol]
-
-    def is_above_ema(self, symbol, price):
-        if self.ema[symbol] == 0:
-            return True
-        return price > self.ema[symbol]
-
-    def is_below_ema(self, symbol, price):
-        if self.ema[symbol] == 0:
-            return True
-        return price < self.ema[symbol]
 
     def get_current_volatility(self, symbol):
         prices = list(self.price_history[symbol])
@@ -246,7 +219,7 @@ class InstitutionalScalper:
         return max(CONFIG["MIN_OFI_THRESHOLD"], min(Decimal('0.60'), threshold))
 
     def open_limit_position(self, symbol, side, reason=""):
-        """LIMIT ORDER – 0% maker fee!"""
+        """LIMIT ORDER – 0% maker fee! No filters, just enter!"""
         book = self.order_books[symbol]
         
         # Use limit price at best bid (for buy) or best ask (for sell)
@@ -256,21 +229,6 @@ class InstitutionalScalper:
             price = book.best_ask()
         
         if price <= 0:
-            return False
-
-        # SPREAD FILTER – now warns but doesn't block (fixed!)
-        spread_bps = book.spread_bps()
-        if spread_bps > CONFIG["MAX_SPREAD_BPS"]:
-            print(f"⚠️ Spread high for {symbol}: {spread_bps:.2f}bps (max {CONFIG['MAX_SPREAD_BPS']}bps) – still trading")
-            # Don't return – just warn and continue
-
-        # EMA TREND FILTER
-        mid = book.mid_price()
-        if side == 'buy' and not self.is_above_ema(symbol, mid):
-            print(f"⚠️ {symbol} price below EMA, skipping buy")
-            return False
-        if side == 'sell' and not self.is_below_ema(symbol, mid):
-            print(f"⚠️ {symbol} price above EMA, skipping sell")
             return False
 
         order_size = CONFIG["ORDER_SIZE_USDT"]
@@ -410,11 +368,11 @@ class InstitutionalScalper:
                 asyncio.create_task(self.subscribe_depth(sym))
                 asyncio.create_task(self.subscribe_trade(sym))
 
-        print("\n🏛️ INSTITUTIONAL HFT SCALPER – FIXED (Spread warning only)")
+        print("\n🏛️ INSTITUTIONAL HFT SCALPER – AGGRESSIVE ENTRY (NO BLOCKS)")
         print(f"   🔍 Iceberg | 🎭 Spoofing | 🌊 Sweep | 📊 Volume-weighted OFI")
-        print(f"   🔄 Adaptive thresholds | 🎯 Trade tape | 📈 EMA trend filter")
-        print(f"   TP: 0.15% | SL: 0.10% | Max spread: {CONFIG['MAX_SPREAD_BPS']}bps (warn only)")
-        print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']} | Limit orders (0% fee)\n")
+        print(f"   🔄 Adaptive thresholds | 🎯 Trade tape confirmation")
+        print(f"   TP: 0.15% | SL: 0.10% | Order size: ${CONFIG['ORDER_SIZE_USDT']}")
+        print(f"   ⚡ ENTERING TRADES IMMEDIATELY – NO FILTERS\n")
 
         last_ofi_print = 0
         last_refresh = time.time()
@@ -449,6 +407,7 @@ class InstitutionalScalper:
                     trade_imb = self.trade_flows[sym].get_imbalance()
                     threshold = self.get_adaptive_threshold(sym)
                     
+                    # PRIORITY 1: Liquidity sweep (reversal trade)
                     sweep = self.trade_flows[sym].detect_liquidity_sweep()
                     if sweep:
                         print(f"🌊 {sym} SWEEP DETECTED → REVERSAL")
@@ -458,6 +417,7 @@ class InstitutionalScalper:
                             self.open_limit_position(sym, 'buy', "[SWEEP]")
                         continue
 
+                    # PRIORITY 2: Strong OFI signal – ENTER IMMEDIATELY
                     if abs(ofi) > threshold:
                         bonus = "🔥" if abs(trade_imb) > Decimal('0.15') else ""
                         if ofi > 0:
