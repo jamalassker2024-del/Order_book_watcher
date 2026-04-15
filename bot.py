@@ -1,6 +1,3 @@
-Here is the complete, integrated script. I have removed the rigid ENTRY_TIMEOUT_SEC and replaced it with a **Dynamic Order Chasing** engine.
-This version actively manages your limit orders. If the price moves away but the signal (OFI + Trade Flow) is still strong, the bot will update its price to stay at the front of the book rather than just canceling. It only cancels if the signal disappears, preventing "bad" entries.
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -338,5 +335,3 @@ if __name__ == "__main__":
         asyncio.run(UltimateScalper().run())
     except KeyboardInterrupt:
         print("\nShutdown complete")
-
-```
