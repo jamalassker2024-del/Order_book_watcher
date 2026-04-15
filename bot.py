@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-FINAL HYBRID SCALPER – MARKET ENTRY FOR EXTREME SIGNALS, LIMIT FOR MODERATE
-- Market entry when OFI > 0.80 (instant, 0.1% fee)
-- Limit entry when 0.55 < OFI ≤ 0.80 (0% fee, 0.5s timeout, fallback to market)
-- Trade tape confirmation (OFI + taker imbalance)
-- Take-profit limit exit (0% fee)
-- Trailing stop (locks profit, no timeout)
+ULTRA‑FAST MARKET SCALPER – INSTANT FILL, HIGH FREQUENCY, EXPONENTIAL GROWTH
+- Market entry (0.1% fee) – never miss a trade
+- Take-profit limit order (0% fee) at 0.12% gross → 0.02% net
+- Stop-loss market order (0.1% fee) at 0.08%
+- Trailing stop locks in profit
+- No timeouts – only price action closes trades
 """
 
 import asyncio
@@ -24,31 +24,28 @@ CONFIG = {
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 5,
-    "OFI_LIMIT_THRESHOLD": Decimal("0.55"),
-    "OFI_MARKET_THRESHOLD": Decimal("0.80"),
+    "OFI_THRESHOLD": Decimal("0.60"),          # Lowered to catch more signals
     "TRADE_IMBALANCE_THRESHOLD": Decimal("0.3"),
-    "TAKE_PROFIT_BPS": Decimal("2"),           # 0.02% pure profit (limit exit)
-    "STOP_LOSS_BPS": Decimal("4"),             # 0.04% initial stop (market exit)
-    "TRAIL_ACTIVATE_BPS": Decimal("1"),        # start trailing after 0.01% profit
-    "TRAIL_DISTANCE_BPS": Decimal("1"),        # trail 0.01% behind
-    "LIMIT_TIMEOUT_SEC": 0.5,                  # cancel limit order after 0.5s
+    "TAKE_PROFIT_BPS": Decimal("12"),          # 0.12% gross → net 0.02% after 0.1% entry fee
+    "STOP_LOSS_BPS": Decimal("8"),             # 0.08% loss (market exit, 0.1% fee)
+    "TRAIL_ACTIVATE_BPS": Decimal("2"),        # start trailing after 0.02% profit
+    "TRAIL_DISTANCE_BPS": Decimal("2"),        # trail 0.02% behind
     "WIN_COOLDOWN_SEC": 1,
-    "LOSS_COOLDOWN_SEC": 15,
-    "SCAN_INTERVAL_MS": 20,
+    "LOSS_COOLDOWN_SEC": 10,                   # shorter cooldown for more trades
+    "SCAN_INTERVAL_MS": 10,                    # 10ms for ultra‑fast reaction
     "REFRESH_BOOK_SEC": 20,
     "BINANCE_WS_DEPTH": "wss://stream.binance.com:9443/ws",
     "BINANCE_WS_TRADE": "wss://stream.binance.com:9443/ws",
 }
 
 TAKER_FEE = Decimal("0.001")   # market entry & stop loss
-MAKER_FEE = Decimal("0")       # limit entry & TP
+MAKER_FEE = Decimal("0")       # limit TP exit
 
-class HybridScalper:
+class FastMarketScalper:
     def __init__(self):
         self.order_books = {}
         self.trade_flows = {}
         self.positions = {}
-        self.pending_entries = {}
         self.balance = CONFIG["INITIAL_BALANCE"]
         self.total_trades = 0
         self.winning_trades = 0
@@ -86,13 +83,6 @@ class HybridScalper:
         def mid_price(self):
             bb, ba = self.best_bid(), self.best_ask()
             return (bb + ba) / 2 if bb and ba else Decimal('0')
-
-        def tick_size(self):
-            if self.bids:
-                prices = sorted(self.bids.keys())
-                if len(prices) > 1:
-                    return abs(prices[1] - prices[0])
-            return Decimal('0.00000001')
 
         def get_ofi(self, depth=5):
             sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:depth]
@@ -172,9 +162,8 @@ class HybridScalper:
             except Exception:
                 await asyncio.sleep(3)
 
-    # ---------- Entry Methods ----------
+    # ---------- Market Entry ----------
     def open_market_position(self, symbol, side):
-        """Market entry – instant fill, pays 0.1% fee"""
         book = self.order_books[symbol]
         price = book.best_ask() if side == 'buy' else book.best_bid()
         if price <= 0:
@@ -197,7 +186,7 @@ class HybridScalper:
 
         tp_bps = CONFIG["TAKE_PROFIT_BPS"]
         sl_bps = CONFIG["STOP_LOSS_BPS"]
-        trail_bps = CONFIG["TRAIL_ACTIVATE_BPS"]
+        trail_activate = CONFIG["TRAIL_ACTIVATE_BPS"]
         trail_dist = CONFIG["TRAIL_DISTANCE_BPS"]
 
         if side == 'buy':
@@ -223,75 +212,8 @@ class HybridScalper:
         print(f"⚡ MARKET {side.upper()} {symbol} @ {price:.8f} | ${order_size:.2f} | Target net: +${net_profit:.4f}")
         return True
 
-    def place_entry_limit(self, symbol, side):
-        """Limit entry – 0% fee, with timeout"""
-        book = self.order_books[symbol]
-        if side == 'buy':
-            price = book.best_bid() + book.tick_size()
-            if price >= book.best_ask():
-                price = book.best_ask() - book.tick_size()
-        else:
-            price = book.best_ask() - book.tick_size()
-            if price <= book.best_bid():
-                price = book.best_bid() + book.tick_size()
-        if price <= 0:
-            return False
-
-        order_size = CONFIG["ORDER_SIZE_USDT"]
-        if order_size > self.balance:
-            order_size = self.balance * Decimal("0.95")
-            if order_size < Decimal("1.00"):
-                return False
-
-        qty = order_size / price
-        self.pending_entries[symbol] = {
-            'side': side,
-            'price': price,
-            'qty': qty,
-            'order_size': order_size,
-            'timestamp': time.time()
-        }
-        print(f"📝 LIMIT {side.upper()} {symbol} @ {price:.8f} (0% fee)")
-        return True
-
-    def check_entries_and_positions(self):
-        now = time.time()
-
-        # 1. Check pending limit entries
-        for sym in list(self.pending_entries.keys()):
-            order = self.pending_entries[sym]
-            book = self.order_books[sym]
-            filled = (order['side'] == 'buy' and book.best_ask() <= order['price']) or \
-                     (order['side'] == 'sell' and book.best_bid() >= order['price'])
-            if filled:
-                # Convert to position
-                tp = order['price'] * (1 + CONFIG["TAKE_PROFIT_BPS"]/10000) if order['side'] == 'buy' else order['price'] * (1 - CONFIG["TAKE_PROFIT_BPS"]/10000)
-                sl = order['price'] * (1 - CONFIG["STOP_LOSS_BPS"]/10000) if order['side'] == 'buy' else order['price'] * (1 + CONFIG["STOP_LOSS_BPS"]/10000)
-                self.balance -= order['order_size']
-                self.positions[sym] = {
-                    'side': order['side'],
-                    'entry': order['price'],
-                    'qty': order['qty'],
-                    'order_size': order['order_size'],
-                    'tp': tp,
-                    'sl': sl,
-                    'best_price': order['price'],
-                    'trailing': False,
-                    'entry_time': now
-                }
-                del self.pending_entries[sym]
-                print(f"✅ FILLED LIMIT {sym} @ {order['price']:.8f} | TP @ {tp:.8f}")
-            elif now - order['timestamp'] > CONFIG["LIMIT_TIMEOUT_SEC"]:
-                # Timeout – check if signal still strong; if yes, upgrade to market
-                action, ofi, imb = self.entry_signal(sym)
-                if action == order['side'] and ofi > CONFIG["OFI_MARKET_THRESHOLD"]:
-                    print(f"⏰ LIMIT TIMEOUT {sym} → upgrading to MARKET {order['side'].upper()}")
-                    self.open_market_position(sym, order['side'])
-                else:
-                    print(f"⌛ LIMIT TIMEOUT {sym} cancelled (signal weak)")
-                del self.pending_entries[sym]
-
-        # 2. Manage open positions (trailing stop, TP, SL)
+    # ---------- Position Management ----------
+    def check_positions(self):
         for sym, pos in list(self.positions.items()):
             book = self.order_books[sym]
             mid = book.mid_price()
@@ -368,14 +290,14 @@ class HybridScalper:
         print(f"{'✅' if profit>0 else '❌'} {reason} {sym} | Profit: ${profit:.4f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[sym] = time.time()
 
-    # ---------- Combined Signal ----------
+    # ---------- Entry Signal ----------
     def entry_signal(self, sym):
         book = self.order_books[sym]
         ofi = book.get_ofi(CONFIG["DEPTH_LEVELS"])
         imb = self.trade_flows[sym].get_imbalance()
-        if ofi > CONFIG["OFI_LIMIT_THRESHOLD"] and imb > CONFIG["TRADE_IMBALANCE_THRESHOLD"]:
+        if ofi > CONFIG["OFI_THRESHOLD"] and imb > CONFIG["TRADE_IMBALANCE_THRESHOLD"]:
             return 'buy', ofi, imb
-        if ofi < -CONFIG["OFI_LIMIT_THRESHOLD"] and imb < -CONFIG["TRADE_IMBALANCE_THRESHOLD"]:
+        if ofi < -CONFIG["OFI_THRESHOLD"] and imb < -CONFIG["TRADE_IMBALANCE_THRESHOLD"]:
             return 'sell', ofi, imb
         return None, ofi, imb
 
@@ -390,9 +312,8 @@ class HybridScalper:
                 asyncio.create_task(self.subscribe_depth(sym))
                 asyncio.create_task(self.subscribe_trade(sym))
 
-        print("\n🚀 HYBRID SCALPER – MARKET (extreme) + LIMIT (moderate)")
-        print(f"   Limit threshold: {CONFIG['OFI_LIMIT_THRESHOLD']} | Market threshold: {CONFIG['OFI_MARKET_THRESHOLD']}")
-        print(f"   TP: 0.02% pure profit | SL: 0.04% | Trail: 0.01% after 0.01% gain")
+        print("\n🚀 ULTRA‑FAST MARKET SCALPER – INSTANT FILL, HIGH FREQUENCY")
+        print(f"   TP: 0.12% gross → 0.02% net | SL: 0.08% | Trail: 0.02% after 0.02% profit")
         print(f"   Position: ${CONFIG['ORDER_SIZE_USDT']} | Balance: ${self.balance}\n")
 
         last_ofi_print = 0
@@ -406,7 +327,7 @@ class HybridScalper:
                         await self.order_books[sym].refresh_snapshot(session)
                     last_refresh = now
 
-                if now - last_ofi_print > 3:
+                if now - last_ofi_print > 2:   # print every 2 seconds
                     ofi_str = []
                     for sym in CONFIG["SYMBOLS"]:
                         ofi = self.order_books[sym].get_ofi(CONFIG["DEPTH_LEVELS"])
@@ -415,22 +336,18 @@ class HybridScalper:
                     print(f"🔍 OFI/IMB: {' | '.join(ofi_str)}")
                     last_ofi_print = now
 
-                self.check_entries_and_positions()
+                self.check_positions()
 
                 for sym in CONFIG["SYMBOLS"]:
-                    if sym in self.positions or sym in self.pending_entries:
+                    if sym in self.positions:
                         continue
                     cooldown = CONFIG["LOSS_COOLDOWN_SEC"] if self.last_trade_result.get(sym) == 'loss' else CONFIG["WIN_COOLDOWN_SEC"]
                     if sym in self.last_trade_time and now - self.last_trade_time[sym] < cooldown:
                         continue
                     action, ofi, imb = self.entry_signal(sym)
                     if action:
-                        if ofi > CONFIG["OFI_MARKET_THRESHOLD"]:
-                            print(f"⚡ {sym} OFI={ofi:.2f} IMB={imb:.2f} → MARKET {action.upper()} (extreme)")
-                            self.open_market_position(sym, action)
-                        else:
-                            print(f"📝 {sym} OFI={ofi:.2f} IMB={imb:.2f} → LIMIT {action.upper()}")
-                            self.place_entry_limit(sym, action)
+                        print(f"⚡ {sym} OFI={ofi:.2f} IMB={imb:.2f} → MARKET {action.upper()}")
+                        self.open_market_position(sym, action)
 
                 if now - self.daily_start >= 86400:
                     print(f"\n💰 DAILY PROFIT: +${self.daily_profit:.4f} | Balance: ${self.balance:.2f}\n")
@@ -441,6 +358,6 @@ class HybridScalper:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(HybridScalper().run())
+        asyncio.run(FastMarketScalper().run())
     except KeyboardInterrupt:
         print("\nShutdown complete")
