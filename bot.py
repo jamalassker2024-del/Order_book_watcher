@@ -2,12 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-ULTRA AGGRESSIVE SCALPER – NO FILTERS, JUST PURE TRADING
-- NO EMA filter
-- NO spread filter
-- Lower OFI threshold (0.20)
-- Limit orders (0% maker fee)
-- All secret techniques preserved
+ULTRA AGGRESSIVE SCALPER – ALL SECRET TECHNIQUES, NO BLOCKS
+- Iceberg detection | Spoofing detection | Sweep detection
+- Volume-weighted OFI | Trade tape confirmation
+- Adaptive thresholds | Trailing stop | Breakeven
+- NO EMA filter | NO spread filter | NO warnings
 - ENTERS EVERY SIGNAL IMMEDIATELY
 """
 
@@ -26,7 +25,7 @@ CONFIG = {
     "ORDER_SIZE_USDT": Decimal("10.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 8,
-    "OFI_THRESHOLD": Decimal("0.20"),           # Much lower – catches all signals
+    "OFI_THRESHOLD": Decimal("0.15"),
     "TAKE_PROFIT_BPS": Decimal("15"),
     "STOP_LOSS_BPS": Decimal("10"),
     "BREAKEVEN_ACTIVATE_BPS": Decimal("2"),
@@ -209,11 +208,18 @@ class UltraAggressiveScalper:
         lows = min(prices[-10:])
         return (highs - lows) / lows if lows > 0 else Decimal('0.001')
 
+    def get_adaptive_threshold(self, symbol):
+        vol = self.get_current_volatility(symbol)
+        vol_bps = vol * 10000
+        if vol_bps > 30:
+            return Decimal('0.15')
+        adjustment = min(Decimal('0.10'), vol * Decimal('30'))
+        threshold = Decimal('0.20') - adjustment
+        return max(Decimal('0.10'), min(Decimal('0.35'), threshold))
+
     def open_limit_position(self, symbol, side, reason=""):
-        """LIMIT ORDER – 0% maker fee! ENTERS IMMEDIATELY!"""
         book = self.order_books[symbol]
         
-        # Use limit price at best bid (for buy) or best ask (for sell)
         if side == 'buy':
             price = book.best_bid()
         else:
@@ -272,7 +278,6 @@ class UltraAggressiveScalper:
             if mid <= 0:
                 continue
 
-            # BREAKEVEN: Move SL to entry after small profit
             if pos['side'] == 'buy':
                 gain_bps = (mid - pos['entry']) / pos['entry'] * 10000
                 if gain_bps >= CONFIG["BREAKEVEN_ACTIVATE_BPS"] and not pos['breakeven_activated']:
@@ -286,7 +291,6 @@ class UltraAggressiveScalper:
                     pos['breakeven_activated'] = True
                     print(f"  🔒 Breakeven activated for {sym}")
 
-            # Trailing stop (after breakeven)
             if pos['side'] == 'buy':
                 if mid > pos['best_price']:
                     pos['best_price'] = mid
@@ -359,12 +363,12 @@ class UltraAggressiveScalper:
                 asyncio.create_task(self.subscribe_depth(sym))
                 asyncio.create_task(self.subscribe_trade(sym))
 
-        print("\n⚡ ULTRA AGGRESSIVE SCALPER – NO FILTERS, PURE TRADING")
+        print("\n⚡ ULTRA AGGRESSIVE SCALPER – ALL TECHNIQUES, NO BLOCKS")
         print(f"   🔍 Iceberg | 🎭 Spoofing | 🌊 Sweep | 📊 Volume-weighted OFI")
-        print(f"   🎯 Trade tape confirmation (bonus only)")
+        print(f"   🎯 Trade tape | 🔄 Adaptive thresholds | 📈 Trailing stop")
         print(f"   TP: 0.15% | SL: 0.10% | OFI threshold: {CONFIG['OFI_THRESHOLD']}")
         print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']} | Limit orders (0% fee)")
-        print(f"   ⚡ ENTERING EVERY SIGNAL – NO BLOCKS\n")
+        print(f"   ⚡ ENTERING EVERY SIGNAL – NO WARNINGS, NO BLOCKS\n")
 
         last_ofi_print = 0
         last_refresh = time.time()
@@ -397,7 +401,6 @@ class UltraAggressiveScalper:
                     ofi = self.order_books[sym].get_volume_weighted_ofi(CONFIG["DEPTH_LEVELS"])
                     trade_imb = self.trade_flows[sym].get_imbalance()
                     
-                    # PRIORITY 1: Liquidity sweep (reversal trade)
                     sweep = self.trade_flows[sym].detect_liquidity_sweep()
                     if sweep:
                         print(f"🌊 {sym} SWEEP DETECTED → REVERSAL")
@@ -407,7 +410,6 @@ class UltraAggressiveScalper:
                             self.open_limit_position(sym, 'buy', "[SWEEP]")
                         continue
 
-                    # PRIORITY 2: OFI signal – ENTER IMMEDIATELY (NO FILTERS)
                     if ofi > CONFIG["OFI_THRESHOLD"]:
                         bonus = "🔥" if abs(trade_imb) > Decimal('0.15') else ""
                         print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → LIMIT BUY")
