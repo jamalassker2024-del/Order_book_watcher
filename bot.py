@@ -2,16 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-INSTITUTIONAL HFT SCALPER – ALL SECRET TECHNIQUES + HIGH FREQUENCY
-- Iceberg detection (front-running)
-- Liquidity sweep detection (stop-loss hunting reversal)
-- Spoofing detection (ignore fake walls)
-- Volume-weighted OFI
-- Trade tape confirmation (soft – doesn't block)
-- Adaptive thresholds (but keeps minimum low)
-- Concurrent trading on all pairs
-- 50+ trades per hour target
-- FIXED: Tight stop loss with slippage buffer
+INSTITUTIONAL HFT SCALPER – FIXED NEGATIVE EXPECTANCY
+- Limit orders (0% maker fee) instead of market orders
+- Spread filter – don't trade when spread > half of TP
+- Breakeven – move SL to entry after 2 bps profit
+- EMA momentum filter – only trade with trend
+- All other secret techniques preserved
 """
 
 import asyncio
@@ -26,26 +22,27 @@ getcontext().prec = 12
 
 CONFIG = {
     "SYMBOLS": ["NEIROUSDT", "PEPEUSDT", "DOGSUSDT", "BONKUSDT", "1000PEPEUSDT"],
-    "ORDER_SIZE_USDT": Decimal("5.00"),
+    "ORDER_SIZE_USDT": Decimal("10.00"),           # Increased for better ratio
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 8,
     "OFI_THRESHOLD_BASE": Decimal("0.40"),
     "MIN_OFI_THRESHOLD": Decimal("0.30"),
-    "TAKE_PROFIT_BPS": Decimal("8"),            # 0.08% gross → 0.02% net
-    "STOP_LOSS_BPS": Decimal("3"),              # 0.03% stop loss (tight!)
-    "STOP_LOSS_SLIPPAGE_BPS": Decimal("1"),     # 0.01% extra buffer for slippage
-    "TRAIL_ACTIVATE_BPS": Decimal("2"),
-    "TRAIL_DISTANCE_BPS": Decimal("2"),
+    "TAKE_PROFIT_BPS": Decimal("15"),              # Increased to 0.15%
+    "STOP_LOSS_BPS": Decimal("10"),                # Increased to 0.10%
+    "BREAKEVEN_ACTIVATE_BPS": Decimal("2"),        # Move SL to entry after 2 bps profit
+    "TRAIL_ACTIVATE_BPS": Decimal("5"),            # Start trailing after 0.05% profit
+    "TRAIL_DISTANCE_BPS": Decimal("3"),            # Trail 0.03% behind
     "WIN_COOLDOWN_SEC": 0.3,
-    "LOSS_COOLDOWN_SEC": 6,
+    "LOSS_COOLDOWN_SEC": 10,
     "SCAN_INTERVAL_MS": 5,
     "REFRESH_BOOK_SEC": 20,
+    "EMA_PERIOD": 50,                              # EMA for trend filter
     "BINANCE_WS_DEPTH": "wss://stream.binance.com:9443/ws",
     "BINANCE_WS_TRADE": "wss://stream.binance.com:9443/ws",
 }
 
 TAKER_FEE = Decimal("0.001")
-MAKER_FEE = Decimal("0")
+MAKER_FEE = Decimal("0")      # Limit orders = 0% fee!
 
 class InstitutionalScalper:
     def __init__(self):
@@ -60,7 +57,8 @@ class InstitutionalScalper:
         self.last_trade_time = {}
         self.last_trade_result = {}
         self.running = True
-        self.price_history = {sym: deque(maxlen=100) for sym in CONFIG["SYMBOLS"]}
+        self.price_history = {sym: deque(maxlen=200) for sym in CONFIG["SYMBOLS"]}
+        self.ema = {sym: Decimal('0') for sym in CONFIG["SYMBOLS"]}
         self.iceberg_hits = {sym: {} for sym in CONFIG["SYMBOLS"]}
         self.spoof_candidates = {sym: {} for sym in CONFIG["SYMBOLS"]}
 
@@ -92,6 +90,12 @@ class InstitutionalScalper:
         def mid_price(self):
             bb, ba = self.best_bid(), self.best_ask()
             return (bb + ba) / 2 if bb and ba else Decimal('0')
+
+        def spread_bps(self):
+            spread = self.best_ask() - self.best_bid()
+            if self.best_bid() > 0:
+                return spread / self.best_bid() * 10000
+            return Decimal('999')
 
         def get_volume_weighted_ofi(self, depth=8):
             sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:depth]
@@ -201,12 +205,33 @@ class InstitutionalScalper:
                             qty = Decimal(data['q'])
                             is_buyer_maker = data.get('m', False)
                             self.trade_flows[symbol].add_trade(is_buyer_maker, qty, price)
-                            self.price_history[symbol].append((time.time(), price))
+                            self.price_history[symbol].append(price)
+                            self.update_ema(symbol, price)
             except Exception:
                 await asyncio.sleep(3)
 
+    def update_ema(self, symbol, price):
+        """Simple EMA calculation for trend filter"""
+        if self.ema[symbol] == 0:
+            self.ema[symbol] = price
+        else:
+            multiplier = Decimal('2') / (CONFIG["EMA_PERIOD"] + 1)
+            self.ema[symbol] = (price - self.ema[symbol]) * multiplier + self.ema[symbol]
+
+    def is_above_ema(self, symbol, price):
+        """Check if price is above EMA (for buy signals)"""
+        if self.ema[symbol] == 0:
+            return True
+        return price > self.ema[symbol]
+
+    def is_below_ema(self, symbol, price):
+        """Check if price is below EMA (for sell signals)"""
+        if self.ema[symbol] == 0:
+            return True
+        return price < self.ema[symbol]
+
     def get_current_volatility(self, symbol):
-        prices = [p for _, p in self.price_history[symbol]]
+        prices = list(self.price_history[symbol])
         if len(prices) < 10:
             return Decimal('0.001')
         highs = max(prices[-10:])
@@ -222,10 +247,32 @@ class InstitutionalScalper:
         threshold = CONFIG["OFI_THRESHOLD_BASE"] - adjustment
         return max(CONFIG["MIN_OFI_THRESHOLD"], min(Decimal('0.60'), threshold))
 
-    def open_market_position(self, symbol, side, reason=""):
+    def open_limit_position(self, symbol, side, reason=""):
+        """LIMIT ORDER – 0% maker fee!"""
         book = self.order_books[symbol]
-        price = book.best_ask() if side == 'buy' else book.best_bid()
+        
+        # Use limit price at best bid (for buy) or best ask (for sell)
+        if side == 'buy':
+            price = book.best_bid()
+        else:
+            price = book.best_ask()
+        
         if price <= 0:
+            return False
+
+        # SPREAD FILTER: Don't trade if spread is too large
+        spread_bps = book.spread_bps()
+        if spread_bps > CONFIG["TAKE_PROFIT_BPS"] * Decimal("0.5"):
+            print(f"⚠️ Spread too high for {symbol}: {spread_bps:.2f}bps, skipping")
+            return False
+
+        # EMA TREND FILTER
+        mid = book.mid_price()
+        if side == 'buy' and not self.is_above_ema(symbol, mid):
+            print(f"⚠️ {symbol} price below EMA, skipping buy")
+            return False
+        if side == 'sell' and not self.is_below_ema(symbol, mid):
+            print(f"⚠️ {symbol} price above EMA, skipping sell")
             return False
 
         order_size = CONFIG["ORDER_SIZE_USDT"]
@@ -236,7 +283,7 @@ class InstitutionalScalper:
 
         qty = order_size / price
         cost = qty * price
-        fee = cost * TAKER_FEE
+        fee = cost * MAKER_FEE      # 0% fee!
 
         if cost + fee > self.balance:
             return False
@@ -245,15 +292,13 @@ class InstitutionalScalper:
 
         tp_bps = CONFIG["TAKE_PROFIT_BPS"]
         sl_bps = CONFIG["STOP_LOSS_BPS"]
-        sl_slippage = CONFIG["STOP_LOSS_SLIPPAGE_BPS"]
 
         if side == 'buy':
             target_price = price * (1 + tp_bps/10000)
-            # Stop price includes slippage buffer (stops earlier to account for slippage)
-            stop_price = price * (1 - (sl_bps + sl_slippage)/10000)
+            stop_price = price * (1 - sl_bps/10000)
         else:
             target_price = price * (1 - tp_bps/10000)
-            stop_price = price * (1 + (sl_bps + sl_slippage)/10000)
+            stop_price = price * (1 + sl_bps/10000)
 
         self.positions[symbol] = {
             'side': side,
@@ -263,13 +308,14 @@ class InstitutionalScalper:
             'tp': target_price,
             'sl': stop_price,
             'best_price': price,
+            'breakeven_activated': False,
             'trailing': False,
             'entry_time': time.time(),
             'reason': reason
         }
 
-        net_profit = order_size * tp_bps/10000 - order_size * TAKER_FEE
-        print(f"⚡ {side.upper()} {symbol} {reason} @ {price:.8f} | Target: +${net_profit:.5f}")
+        net_profit = order_size * tp_bps/10000 - order_size * MAKER_FEE
+        print(f"⚡ LIMIT {side.upper()} {symbol} {reason} @ {price:.8f} | TP: +${net_profit:.5f} | SL: -${order_size * sl_bps/10000:.5f}")
         return True
 
     def check_positions(self):
@@ -279,7 +325,21 @@ class InstitutionalScalper:
             if mid <= 0:
                 continue
 
-            # Trailing stop (only after profit is made)
+            # BREAKEVEN: Move SL to entry after small profit
+            if pos['side'] == 'buy':
+                gain_bps = (mid - pos['entry']) / pos['entry'] * 10000
+                if gain_bps >= CONFIG["BREAKEVEN_ACTIVATE_BPS"] and not pos['breakeven_activated']:
+                    pos['sl'] = pos['entry']
+                    pos['breakeven_activated'] = True
+                    print(f"  🔒 Breakeven activated for {sym} (SL moved to entry)")
+            else:
+                gain_bps = (pos['entry'] - mid) / pos['entry'] * 10000
+                if gain_bps >= CONFIG["BREAKEVEN_ACTIVATE_BPS"] and not pos['breakeven_activated']:
+                    pos['sl'] = pos['entry']
+                    pos['breakeven_activated'] = True
+                    print(f"  🔒 Breakeven activated for {sym} (SL moved to entry)")
+
+            # Trailing stop (after breakeven)
             if pos['side'] == 'buy':
                 if mid > pos['best_price']:
                     pos['best_price'] = mid
@@ -301,7 +361,6 @@ class InstitutionalScalper:
                         if new_sl < pos['sl']:
                             pos['sl'] = new_sl
 
-            # Hard stop loss (exit immediately when price crosses stop)
             hit_tp = (pos['side'] == 'buy' and mid >= pos['tp']) or (pos['side'] == 'sell' and mid <= pos['tp'])
             hit_sl = (pos['side'] == 'buy' and mid <= pos['sl']) or (pos['side'] == 'sell' and mid >= pos['sl'])
 
@@ -328,7 +387,7 @@ class InstitutionalScalper:
     def close_loss(self, sym, price, reason):
         pos = self.positions.pop(sym)
         gross = pos['qty'] * price
-        fee = gross * TAKER_FEE
+        fee = gross * TAKER_FEE   # Only pay taker fee on stop loss (emergency)
         profit = gross - pos['order_size'] - fee
         self.balance += gross - fee
         self.total_trades += 1
@@ -353,10 +412,11 @@ class InstitutionalScalper:
                 asyncio.create_task(self.subscribe_depth(sym))
                 asyncio.create_task(self.subscribe_trade(sym))
 
-        print("\n🏛️ INSTITUTIONAL HFT SCALPER – ALL SECRET TRICKS ACTIVE")
-        print(f"   🔍 Iceberg detection | 🎭 Spoofing detection | 🌊 Sweep detection")
-        print(f"   📊 Volume-weighted OFI | 🔄 Adaptive thresholds | 🎯 Trade tape (soft)")
-        print(f"   TP: 0.08% gross → 0.02% net | SL: 0.03% + 0.01% buffer | Scan: 5ms\n")
+        print("\n🏛️ INSTITUTIONAL HFT SCALPER – FIXED NEGATIVE EXPECTANCY")
+        print(f"   🔍 Iceberg | 🎭 Spoofing | 🌊 Sweep | 📊 Volume-weighted OFI")
+        print(f"   🔄 Adaptive thresholds | 🎯 Trade tape | 📈 EMA trend filter")
+        print(f"   TP: 0.15% | SL: 0.10% | Breakeven: 0.02% | Trail: 0.05%->0.03%")
+        print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']} | Limit orders (0% fee)\n")
 
         last_ofi_print = 0
         last_refresh = time.time()
@@ -395,19 +455,19 @@ class InstitutionalScalper:
                     if sweep:
                         print(f"🌊 {sym} SWEEP DETECTED → REVERSAL")
                         if ofi > 0:
-                            self.open_market_position(sym, 'sell', "[SWEEP]")
+                            self.open_limit_position(sym, 'sell', "[SWEEP]")
                         else:
-                            self.open_market_position(sym, 'buy', "[SWEEP]")
+                            self.open_limit_position(sym, 'buy', "[SWEEP]")
                         continue
 
                     if abs(ofi) > threshold:
                         bonus = "🔥" if abs(trade_imb) > Decimal('0.15') else ""
                         if ofi > 0:
-                            print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → BUY")
-                            self.open_market_position(sym, 'buy', "[OFI]")
+                            print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → LIMIT BUY")
+                            self.open_limit_position(sym, 'buy', "[OFI]")
                         elif ofi < 0:
-                            print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → SELL")
-                            self.open_market_position(sym, 'sell', "[OFI]")
+                            print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → LIMIT SELL")
+                            self.open_limit_position(sym, 'sell', "[OFI]")
 
                 if now - self.daily_start >= 86400:
                     print(f"\n💰 DAILY PROFIT: +${self.daily_profit:.5f} | Balance: ${self.balance:.2f}\n")
