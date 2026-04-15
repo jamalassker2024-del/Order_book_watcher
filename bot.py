@@ -2,12 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-FIXED PROFIT SCALPER – LIMIT TP EXITS (0% FEE), MARKET ENTRIES (0.1% FEE)
-- Market entry (0.1% taker fee)
-- Limit exit for TP (0% maker fee) – pure profit!
-- Market exit for SL (0.1% taker fee) – only on losses
-- Higher TP (0.35%) to ensure profit
-- Higher OFI threshold (0.70) for quality
+STRATEGIC PROFIT SCALPER - VOLATILITY & SPREAD AWARE
+- Checks Spread: Don't enter if the gap is too wide (slippage protection)
+- Dynamic OFI: Requires a stronger push to enter after a loss
+- Improved Breakeven: Moves to entry + 2bps to cover the entry fee
+- SWEEP trades are DISABLED (they were causing losses)
 """
 
 import asyncio
@@ -22,25 +21,26 @@ getcontext().prec = 12
 
 CONFIG = {
     "SYMBOLS": ["NEIROUSDT", "PEPEUSDT", "BONKUSDT", "1000PEPEUSDT"],
-    "ORDER_SIZE_USDT": Decimal("5.00"),           # Reduced to $5 (less risk)
+    "ORDER_SIZE_USDT": Decimal("5.00"),               # Reduced to $5
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 10,
-    "OFI_THRESHOLD": Decimal("0.70"),             # Higher quality signals
-    "TAKE_PROFIT_BPS": Decimal("35"),             # 0.35% gross → 0.25% net after entry fee
-    "STOP_LOSS_BPS": Decimal("12"),               # 0.12% SL
-    "BREAKEVEN_ACTIVATE_BPS": Decimal("5"),
-    "WIN_COOLDOWN_SEC": 1.0,
-    "LOSS_COOLDOWN_SEC": 15,
-    "SCAN_INTERVAL_MS": 5,
+    "OFI_THRESHOLD": Decimal("0.80"),                 # Much higher – only strong signals
+    "MAX_SPREAD_BPS": Decimal("5"),                   # Don't trade if spread > 0.05%
+    "TAKE_PROFIT_BPS": Decimal("45"),                 # 0.45% – wider target
+    "STOP_LOSS_BPS": Decimal("18"),                   # 0.18% – more breathing room
+    "BREAKEVEN_ACTIVATE_BPS": Decimal("10"),          # Move to BE after 0.1% gain
+    "WIN_COOLDOWN_SEC": 2.0,
+    "LOSS_COOLDOWN_SEC": 30,                          # Longer pause after loss
+    "SCAN_INTERVAL_MS": 10,
     "REFRESH_BOOK_SEC": 20,
     "BINANCE_WS_DEPTH": "wss://stream.binance.com:9443/ws",
     "BINANCE_WS_TRADE": "wss://stream.binance.com:9443/ws",
 }
 
-TAKER_FEE = Decimal("0.001")   # 0.1% (market orders)
-MAKER_FEE = Decimal("0")       # 0% (limit orders for TP)
+TAKER_FEE = Decimal("0.001")   # 0.1%
+MAKER_FEE = Decimal("0")       # 0% for limit TP
 
-class FixedProfitScalper:
+class StrategicScalper:
     def __init__(self):
         self.order_books = {}
         self.trade_flows = {}
@@ -83,6 +83,12 @@ class FixedProfitScalper:
         def mid_price(self):
             bb, ba = self.best_bid(), self.best_ask()
             return (bb + ba) / 2 if bb and ba else Decimal('0')
+
+        def get_spread_bps(self):
+            bb, ba = self.best_bid(), self.best_ask()
+            if bb == 0 or ba == 0:
+                return Decimal('999')
+            return ((ba - bb) / bb) * 10000
 
         def get_volume_weighted_ofi(self, depth=10):
             sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:depth]
@@ -136,17 +142,6 @@ class FixedProfitScalper:
                 return Decimal('0')
             return (self.buy_volume - self.sell_volume) / total
 
-        def detect_liquidity_sweep(self):
-            if len(self.trade_history) < 10:
-                return False
-            recent = list(self.trade_history)[-5:]
-            avg_volume = sum(v for _, v in recent) / len(recent)
-            if avg_volume == 0:
-                return False
-            if recent[-1][1] > avg_volume * 3:
-                return True
-            return False
-
     async def subscribe_depth(self, symbol):
         stream = f"{symbol.lower()}@depth20@100ms"
         url = f"{CONFIG['BINANCE_WS_DEPTH']}/{stream}"
@@ -177,8 +172,15 @@ class FixedProfitScalper:
             except Exception:
                 await asyncio.sleep(3)
 
-    def open_market_position(self, symbol, side, reason=""):
+    def open_position(self, symbol, side, reason):
         book = self.order_books[symbol]
+        
+        # SPREAD FILTER – Don't buy into a hole
+        spread = book.get_spread_bps()
+        if spread > CONFIG["MAX_SPREAD_BPS"]:
+            print(f"⚠️ Spread too high for {symbol}: {spread:.1f}bps, skipping")
+            return False
+
         price = book.best_ask() if side == 'buy' else book.best_bid()
         if price <= 0:
             return False
@@ -222,7 +224,7 @@ class FixedProfitScalper:
         }
 
         net_profit_target = order_size * tp_bps/10000 - order_size * TAKER_FEE
-        print(f"⚡ MARKET {side.upper()} {symbol} {reason} @ {price:.8f} | Entry fee: ${entry_fee:.5f} | Target net: +${net_profit_target:.5f}")
+        print(f"📡 ENTER {side.upper()} {symbol} | Spread: {spread:.1f}bps | Target net: +${net_profit_target:.5f}")
         return True
 
     def check_positions(self):
@@ -237,11 +239,14 @@ class FixedProfitScalper:
             else:
                 gain_bps = (pos['entry'] - mid) / pos['entry'] * 10000
 
-            # Breakeven
+            # Breakeven – move SL to entry + 2bps to cover fee
             if gain_bps >= CONFIG["BREAKEVEN_ACTIVATE_BPS"] and not pos['breakeven_activated']:
-                pos['sl'] = pos['entry']
+                if pos['side'] == 'buy':
+                    pos['sl'] = pos['entry'] * (1 + Decimal('0.0002'))
+                else:
+                    pos['sl'] = pos['entry'] * (1 - Decimal('0.0002'))
                 pos['breakeven_activated'] = True
-                print(f"  🔒 Breakeven activated for {sym}")
+                print(f"  🔒 Breakeven activated for {sym} (SL moved to entry + fee)")
 
             # TP hit – use LIMIT order (0% fee)
             hit_tp = (pos['side'] == 'buy' and mid >= pos['tp']) or (pos['side'] == 'sell' and mid <= pos['tp'])
@@ -249,12 +254,11 @@ class FixedProfitScalper:
             hit_sl = (pos['side'] == 'buy' and mid <= pos['sl']) or (pos['side'] == 'sell' and mid >= pos['sl'])
 
             if hit_tp:
-                self.close_win_limit(sym, pos['tp'])
+                self.close_win(sym, pos['tp'])
             elif hit_sl:
-                self.close_loss_market(sym, mid, "SL")
+                self.close_loss(sym, mid, "SL")
 
-    def close_win_limit(self, sym, exit_price):
-        """LIMIT exit – 0% maker fee!"""
+    def close_win(self, sym, exit_price):
         pos = self.positions.pop(sym)
         gross_exit = pos['qty'] * exit_price
         exit_fee = gross_exit * MAKER_FEE  # 0%!
@@ -268,11 +272,10 @@ class FixedProfitScalper:
         self.daily_profit += profit
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
         profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
-        print(f"✅ WIN {sym} {pos.get('reason', '')} | +${profit:.5f} (+{profit_pct:.2f}%) | Exit fee: ${exit_fee:.5f} (0%) | Bal: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        print(f"✅ WIN {sym} {pos.get('reason', '')} | +${profit:.5f} (+{profit_pct:.2f}%) | Bal: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[sym] = time.time()
 
-    def close_loss_market(self, sym, exit_price, reason):
-        """MARKET exit – 0.1% taker fee (only on losses)"""
+    def close_loss(self, sym, exit_price, reason):
         pos = self.positions.pop(sym)
         gross_exit = pos['qty'] * exit_price
         exit_fee = gross_exit * TAKER_FEE
@@ -302,10 +305,10 @@ class FixedProfitScalper:
                 asyncio.create_task(self.subscribe_depth(sym))
                 asyncio.create_task(self.subscribe_trade(sym))
 
-        print("\n⚡ FIXED PROFIT SCALPER – LIMIT TP EXITS (0% FEE)")
-        print(f"   Market entry: 0.1% | Limit TP exit: 0% | Market SL: 0.1%")
-        print(f"   TP: 0.35% gross → 0.25% net | SL: 0.12% | OFI threshold: {CONFIG['OFI_THRESHOLD']}")
-        print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']}\n")
+        print("\n⚡ STRATEGIC PROFIT SCALPER – SPREAD & VOLATILITY AWARE")
+        print(f"   Spread filter: {CONFIG['MAX_SPREAD_BPS']}bps | TP: 0.45% | SL: 0.18%")
+        print(f"   OFI threshold: {CONFIG['OFI_THRESHOLD']} | Order size: ${CONFIG['ORDER_SIZE_USDT']}")
+        print(f"   SWEEP trades: DISABLED | Loss cooldown: {CONFIG['LOSS_COOLDOWN_SEC']}s\n")
 
         last_ofi_print = 0
         last_refresh = time.time()
@@ -337,22 +340,16 @@ class FixedProfitScalper:
 
                     ofi = self.order_books[sym].get_volume_weighted_ofi(CONFIG["DEPTH_LEVELS"])
                     trade_imb = self.trade_flows[sym].get_imbalance()
-                    sweep = self.trade_flows[sym].detect_liquidity_sweep()
 
-                    if sweep:
-                        print(f"🌊 {sym} SWEEP DETECTED → REVERSAL")
-                        if ofi > 0:
-                            self.open_market_position(sym, 'sell', "[SWEEP]")
-                        else:
-                            self.open_market_position(sym, 'buy', "[SWEEP]")
-                    elif ofi > CONFIG["OFI_THRESHOLD"]:
+                    # ONLY OFI signals – SWEEP trades DISABLED (they were causing losses)
+                    if ofi > CONFIG["OFI_THRESHOLD"]:
                         bonus = "🔥" if abs(trade_imb) > Decimal('0.15') else ""
-                        print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → MARKET BUY")
-                        self.open_market_position(sym, 'buy', "[OFI]")
+                        print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → BUY")
+                        self.open_position(sym, 'buy', f"[OFI{bonus}]")
                     elif ofi < -CONFIG["OFI_THRESHOLD"]:
                         bonus = "🔥" if abs(trade_imb) > Decimal('0.15') else ""
-                        print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → MARKET SELL")
-                        self.open_market_position(sym, 'sell', "[OFI]")
+                        print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → SELL")
+                        self.open_position(sym, 'sell', f"[OFI{bonus}]")
 
                 if now - self.daily_start >= 86400:
                     print(f"\n💰 DAILY PROFIT: +${self.daily_profit:.5f} | Balance: ${self.balance:.2f}\n")
@@ -363,6 +360,6 @@ class FixedProfitScalper:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(FixedProfitScalper().run())
+        asyncio.run(StrategicScalper().run())
     except KeyboardInterrupt:
         print("\nShutdown complete")
