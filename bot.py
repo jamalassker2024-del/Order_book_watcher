@@ -7,6 +7,7 @@ ULTIMATE NO‑TIMEOUT SCALPER – OFI + TRADE TAPE, LIMIT ENTRY/TP, TRAILING STO
 - Limit entry (aggressive maker) + limit TP (0% fees)
 - Trailing stop locks in profit, no timeout
 - $5 position size, $100 balance
+- Fixed: no mid_price() call, uses best_bid/best_ask directly
 """
 
 import asyncio
@@ -15,7 +16,6 @@ import websockets
 import aiohttp
 from decimal import Decimal, getcontext
 import time
-from collections import deque
 
 getcontext().prec = 12
 
@@ -30,7 +30,7 @@ CONFIG = {
     "STOP_LOSS_BPS": Decimal("4"),                 # 0.04% initial stop (market exit)
     "TRAIL_ACTIVATE_BPS": Decimal("1"),            # start trailing after 0.01% profit
     "TRAIL_DISTANCE_BPS": Decimal("1"),            # trail 0.01% behind
-    "ENTRY_TIMEOUT_SEC": 2,                        # cancel unfilled limit entry (not a position timeout)
+    "ENTRY_TIMEOUT_SEC": 2,                        # cancel unfilled limit entry
     "WIN_COOLDOWN_SEC": 1,
     "LOSS_COOLDOWN_SEC": 15,
     "SCAN_INTERVAL_MS": 20,
@@ -237,11 +237,14 @@ class UltimateScalper:
         # Manage open positions (no timeout – only TP, SL, or trailing)
         for sym, pos in list(self.positions.items()):
             book = self.order_books[sym]
-            mid = book.mid_price()
-            if mid <= 0:
+            # Calculate mid price from best bid/ask (no separate method)
+            best_bid = book.best_bid()
+            best_ask = book.best_ask()
+            if best_bid <= 0 or best_ask <= 0:
                 continue
+            mid = (best_bid + best_ask) / 2
 
-            # Update trailing stop (only after profit is made)
+            # Update trailing stop
             if pos['side'] == 'buy':
                 if mid > pos['best_price']:
                     pos['best_price'] = mid
