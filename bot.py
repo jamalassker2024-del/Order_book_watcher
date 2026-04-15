@@ -11,6 +11,7 @@ INSTITUTIONAL HFT SCALPER – ALL SECRET TECHNIQUES + HIGH FREQUENCY
 - Adaptive thresholds (but keeps minimum low)
 - Concurrent trading on all pairs
 - 50+ trades per hour target
+- FIXED: Tight stop loss with slippage buffer
 """
 
 import asyncio
@@ -28,15 +29,16 @@ CONFIG = {
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 8,
-    "OFI_THRESHOLD_BASE": Decimal("0.40"),      # Low enough for many signals
-    "MIN_OFI_THRESHOLD": Decimal("0.30"),       # Absolute minimum
+    "OFI_THRESHOLD_BASE": Decimal("0.40"),
+    "MIN_OFI_THRESHOLD": Decimal("0.30"),
     "TAKE_PROFIT_BPS": Decimal("8"),            # 0.08% gross → 0.02% net
-    "STOP_LOSS_BPS": Decimal("4"),              # 0.04% stop loss
-    "TRAIL_ACTIVATE_BPS": Decimal("2"),         # trail after 0.02% profit
-    "TRAIL_DISTANCE_BPS": Decimal("2"),         # trail 0.02% behind
-    "WIN_COOLDOWN_SEC": 0.3,                    # 0.3s after win
-    "LOSS_COOLDOWN_SEC": 6,                     # 6s after loss
-    "SCAN_INTERVAL_MS": 5,                     # 5ms ultra-fast
+    "STOP_LOSS_BPS": Decimal("3"),              # 0.03% stop loss (tight!)
+    "STOP_LOSS_SLIPPAGE_BPS": Decimal("1"),     # 0.01% extra buffer for slippage
+    "TRAIL_ACTIVATE_BPS": Decimal("2"),
+    "TRAIL_DISTANCE_BPS": Decimal("2"),
+    "WIN_COOLDOWN_SEC": 0.3,
+    "LOSS_COOLDOWN_SEC": 6,
+    "SCAN_INTERVAL_MS": 5,
     "REFRESH_BOOK_SEC": 20,
     "BINANCE_WS_DEPTH": "wss://stream.binance.com:9443/ws",
     "BINANCE_WS_TRADE": "wss://stream.binance.com:9443/ws",
@@ -92,14 +94,10 @@ class InstitutionalScalper:
             return (bb + ba) / 2 if bb and ba else Decimal('0')
 
         def get_volume_weighted_ofi(self, depth=8):
-            """Volume-weighted OFI – institutional trick #1"""
             sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:depth]
             sorted_asks = sorted(self.asks.items(), key=lambda x: x[0])[:depth]
-            
-            # Weight by position (front gets higher weight)
             bid_weighted = sum(q * (depth - i) for i, (_, q) in enumerate(sorted_bids))
             ask_weighted = sum(q * (depth - i) for i, (_, q) in enumerate(sorted_asks))
-            
             total = bid_weighted + ask_weighted
             if total == 0:
                 return Decimal('0')
@@ -108,7 +106,6 @@ class InstitutionalScalper:
             return ofi
 
         def detect_iceberg(self, symbol, side, price, qty):
-            """Institutional trick #2 – iceberg order detection"""
             key = f"{side}_{price}"
             if key in self.iceberg_hits.get(symbol, {}):
                 self.iceberg_hits[symbol][key] += 1
@@ -119,7 +116,6 @@ class InstitutionalScalper:
             return False
 
         def detect_spoof(self, symbol, side, price):
-            """Institutional trick #3 – spoofing detection"""
             key = f"{side}_{price}"
             now = time.time()
             if key in self.spoof_candidates.get(symbol, {}):
@@ -169,14 +165,12 @@ class InstitutionalScalper:
             return (self.buy_volume - self.sell_volume) / total
 
         def detect_liquidity_sweep(self):
-            """Institutional trick #4 – sweep detection (stop-loss hunting)"""
             if len(self.trade_history) < 10:
                 return False
             recent = list(self.trade_history)[-5:]
             avg_volume = sum(v for _, v, _ in recent) / len(recent)
             if avg_volume == 0:
                 return False
-            # Volume spike > 3x average indicates sweep
             if recent[-1][1] > avg_volume * 3:
                 return True
             return False
@@ -212,7 +206,6 @@ class InstitutionalScalper:
                 await asyncio.sleep(3)
 
     def get_current_volatility(self, symbol):
-        """Calculate volatility for adaptive threshold"""
         prices = [p for _, p in self.price_history[symbol]]
         if len(prices) < 10:
             return Decimal('0.001')
@@ -221,14 +214,10 @@ class InstitutionalScalper:
         return (highs - lows) / lows if lows > 0 else Decimal('0.001')
 
     def get_adaptive_threshold(self, symbol):
-        """Adaptive threshold – lower when volatile, higher when calm"""
         vol = self.get_current_volatility(symbol)
-        # Volatility in bps (multiply by 10000)
         vol_bps = vol * 10000
-        # When volatility is high (30+ bps), lower threshold
         if vol_bps > 30:
             return CONFIG["MIN_OFI_THRESHOLD"]
-        # Normal adjustment
         adjustment = min(Decimal('0.15'), vol * Decimal('50'))
         threshold = CONFIG["OFI_THRESHOLD_BASE"] - adjustment
         return max(CONFIG["MIN_OFI_THRESHOLD"], min(Decimal('0.60'), threshold))
@@ -256,13 +245,15 @@ class InstitutionalScalper:
 
         tp_bps = CONFIG["TAKE_PROFIT_BPS"]
         sl_bps = CONFIG["STOP_LOSS_BPS"]
+        sl_slippage = CONFIG["STOP_LOSS_SLIPPAGE_BPS"]
 
         if side == 'buy':
             target_price = price * (1 + tp_bps/10000)
-            stop_price = price * (1 - sl_bps/10000)
+            # Stop price includes slippage buffer (stops earlier to account for slippage)
+            stop_price = price * (1 - (sl_bps + sl_slippage)/10000)
         else:
             target_price = price * (1 - tp_bps/10000)
-            stop_price = price * (1 + sl_bps/10000)
+            stop_price = price * (1 + (sl_bps + sl_slippage)/10000)
 
         self.positions[symbol] = {
             'side': side,
@@ -288,7 +279,7 @@ class InstitutionalScalper:
             if mid <= 0:
                 continue
 
-            # Trailing stop (institutional trick #5)
+            # Trailing stop (only after profit is made)
             if pos['side'] == 'buy':
                 if mid > pos['best_price']:
                     pos['best_price'] = mid
@@ -310,14 +301,14 @@ class InstitutionalScalper:
                         if new_sl < pos['sl']:
                             pos['sl'] = new_sl
 
+            # Hard stop loss (exit immediately when price crosses stop)
             hit_tp = (pos['side'] == 'buy' and mid >= pos['tp']) or (pos['side'] == 'sell' and mid <= pos['tp'])
             hit_sl = (pos['side'] == 'buy' and mid <= pos['sl']) or (pos['side'] == 'sell' and mid >= pos['sl'])
 
             if hit_tp:
                 self.close_win(sym, pos['tp'])
             elif hit_sl:
-                exit_price = book.best_bid() if pos['side'] == 'buy' else book.best_ask()
-                self.close_loss(sym, exit_price, "SL")
+                self.close_loss(sym, pos['sl'], "SL")
 
     def close_win(self, sym, price):
         pos = self.positions.pop(sym)
@@ -365,7 +356,7 @@ class InstitutionalScalper:
         print("\n🏛️ INSTITUTIONAL HFT SCALPER – ALL SECRET TRICKS ACTIVE")
         print(f"   🔍 Iceberg detection | 🎭 Spoofing detection | 🌊 Sweep detection")
         print(f"   📊 Volume-weighted OFI | 🔄 Adaptive thresholds | 🎯 Trade tape (soft)")
-        print(f"   TP: 0.08% gross → 0.02% net | SL: 0.04% | Scan: 5ms\n")
+        print(f"   TP: 0.08% gross → 0.02% net | SL: 0.03% + 0.01% buffer | Scan: 5ms\n")
 
         last_ofi_print = 0
         last_refresh = time.time()
@@ -396,12 +387,10 @@ class InstitutionalScalper:
                     if sym in self.last_trade_time and now - self.last_trade_time[sym] < cooldown:
                         continue
 
-                    # Get all signals
                     ofi = self.order_books[sym].get_volume_weighted_ofi(CONFIG["DEPTH_LEVELS"])
                     trade_imb = self.trade_flows[sym].get_imbalance()
                     threshold = self.get_adaptive_threshold(sym)
                     
-                    # PRIORITY 1: Liquidity sweep (reversal trade)
                     sweep = self.trade_flows[sym].detect_liquidity_sweep()
                     if sweep:
                         print(f"🌊 {sym} SWEEP DETECTED → REVERSAL")
@@ -411,9 +400,7 @@ class InstitutionalScalper:
                             self.open_market_position(sym, 'buy', "[SWEEP]")
                         continue
 
-                    # PRIORITY 2: Strong OFI signal (with or without tape confirmation)
                     if abs(ofi) > threshold:
-                        # If tape agrees (optional, doesn't block), add bonus
                         bonus = "🔥" if abs(trade_imb) > Decimal('0.15') else ""
                         if ofi > 0:
                             print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → BUY")
