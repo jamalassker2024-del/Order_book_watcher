@@ -25,7 +25,7 @@ CONFIG = {
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 5,
-    "OFI_THRESHOLD": Decimal("0.30"),          # Much lower – catches everything
+    "OFI_THRESHOLD": Decimal("0.12"),          # Much lower – catches everything
     "TAKE_PROFIT_BPS": Decimal("8"),           # 0.08% gross → 0.02% net after 0.06% fees
     "STOP_LOSS_BPS": Decimal("6"),             # 0.06% stop loss
     "TRAIL_ACTIVATE_BPS": Decimal("2"),        # start trailing after 0.02% profit
