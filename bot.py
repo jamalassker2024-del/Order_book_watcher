@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-PROFIT FOCUSED SCALPER – CORRECT FEE MATH, HIGH WIN RATE
-- Honest accounting (entry + exit fees)
-- Higher TP (0.25%) to overcome 0.2% fees
-- Higher OFI threshold (0.65) for quality signals
-- All powerful features preserved
+FIXED PROFIT SCALPER – LIMIT TP EXITS (0% FEE), MARKET ENTRIES (0.1% FEE)
+- Market entry (0.1% taker fee)
+- Limit exit for TP (0% maker fee) – pure profit!
+- Market exit for SL (0.1% taker fee) – only on losses
+- Higher TP (0.35%) to ensure profit
+- Higher OFI threshold (0.70) for quality
 """
 
 import asyncio
@@ -21,24 +22,25 @@ getcontext().prec = 12
 
 CONFIG = {
     "SYMBOLS": ["NEIROUSDT", "PEPEUSDT", "BONKUSDT", "1000PEPEUSDT"],
-    "ORDER_SIZE_USDT": Decimal("10.00"),
+    "ORDER_SIZE_USDT": Decimal("5.00"),           # Reduced to $5 (less risk)
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 10,
-    "OFI_THRESHOLD": Decimal("0.65"),
-    "TAKE_PROFIT_BPS": Decimal("25"),           # 0.25% – covers 0.2% fees + 0.05% profit
-    "STOP_LOSS_BPS": Decimal("15"),             # 0.15% SL
+    "OFI_THRESHOLD": Decimal("0.70"),             # Higher quality signals
+    "TAKE_PROFIT_BPS": Decimal("35"),             # 0.35% gross → 0.25% net after entry fee
+    "STOP_LOSS_BPS": Decimal("12"),               # 0.12% SL
     "BREAKEVEN_ACTIVATE_BPS": Decimal("5"),
     "WIN_COOLDOWN_SEC": 1.0,
-    "LOSS_COOLDOWN_SEC": 10,
+    "LOSS_COOLDOWN_SEC": 15,
     "SCAN_INTERVAL_MS": 5,
     "REFRESH_BOOK_SEC": 20,
     "BINANCE_WS_DEPTH": "wss://stream.binance.com:9443/ws",
     "BINANCE_WS_TRADE": "wss://stream.binance.com:9443/ws",
 }
 
-TAKER_FEE = Decimal("0.001")   # 0.1% entry + 0.1% exit = 0.2% total
+TAKER_FEE = Decimal("0.001")   # 0.1% (market orders)
+MAKER_FEE = Decimal("0")       # 0% (limit orders for TP)
 
-class ProfitFocusedScalper:
+class FixedProfitScalper:
     def __init__(self):
         self.order_books = {}
         self.trade_flows = {}
@@ -52,8 +54,6 @@ class ProfitFocusedScalper:
         self.last_trade_result = {}
         self.running = True
         self.price_history = {sym: deque(maxlen=200) for sym in CONFIG["SYMBOLS"]}
-        self.iceberg_hits = {sym: {} for sym in CONFIG["SYMBOLS"]}
-        self.spoof_candidates = {sym: {} for sym in CONFIG["SYMBOLS"]}
 
     class OrderBook:
         def __init__(self, symbol):
@@ -95,25 +95,6 @@ class ProfitFocusedScalper:
             ofi = (bid_weighted - ask_weighted) / total
             self.ofi_history.append((time.time(), ofi))
             return ofi
-
-        def detect_iceberg(self, symbol, side, price, qty):
-            key = f"{side}_{price}"
-            if key in self.iceberg_hits.get(symbol, {}):
-                self.iceberg_hits[symbol][key] += 1
-                if self.iceberg_hits[symbol][key] >= 3:
-                    return True
-            else:
-                self.iceberg_hits[symbol][key] = 1
-            return False
-
-        def detect_spoof(self, symbol, side, price):
-            key = f"{side}_{price}"
-            now = time.time()
-            if key in self.spoof_candidates.get(symbol, {}):
-                if now - self.spoof_candidates[symbol][key] < 0.5:
-                    return True
-            self.spoof_candidates[symbol][key] = now
-            return False
 
         async def refresh_snapshot(self, session):
             url = f"https://api.binance.com/api/v3/depth?symbol={self.symbol}&limit=20"
@@ -240,7 +221,7 @@ class ProfitFocusedScalper:
             'reason': reason
         }
 
-        net_profit_target = order_size * tp_bps/10000 - order_size * TAKER_FEE * 2
+        net_profit_target = order_size * tp_bps/10000 - order_size * TAKER_FEE
         print(f"⚡ MARKET {side.upper()} {symbol} {reason} @ {price:.8f} | Entry fee: ${entry_fee:.5f} | Target net: +${net_profit_target:.5f}")
         return True
 
@@ -262,19 +243,21 @@ class ProfitFocusedScalper:
                 pos['breakeven_activated'] = True
                 print(f"  🔒 Breakeven activated for {sym}")
 
-            # Check exits
+            # TP hit – use LIMIT order (0% fee)
             hit_tp = (pos['side'] == 'buy' and mid >= pos['tp']) or (pos['side'] == 'sell' and mid <= pos['tp'])
+            # SL hit – use MARKET order (0.1% fee)
             hit_sl = (pos['side'] == 'buy' and mid <= pos['sl']) or (pos['side'] == 'sell' and mid >= pos['sl'])
 
             if hit_tp:
-                self.close_win(sym, mid)
+                self.close_win_limit(sym, pos['tp'])
             elif hit_sl:
-                self.close_loss(sym, mid, "SL")
+                self.close_loss_market(sym, mid, "SL")
 
-    def close_win(self, sym, exit_price):
+    def close_win_limit(self, sym, exit_price):
+        """LIMIT exit – 0% maker fee!"""
         pos = self.positions.pop(sym)
         gross_exit = pos['qty'] * exit_price
-        exit_fee = gross_exit * TAKER_FEE
+        exit_fee = gross_exit * MAKER_FEE  # 0%!
         net_return = gross_exit - exit_fee
         profit = net_return - pos['order_size']
 
@@ -285,10 +268,11 @@ class ProfitFocusedScalper:
         self.daily_profit += profit
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
         profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
-        print(f"✅ WIN {sym} {pos.get('reason', '')} | +${profit:.5f} (+{profit_pct:.2f}%) | Exit fee: ${exit_fee:.5f} | Bal: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        print(f"✅ WIN {sym} {pos.get('reason', '')} | +${profit:.5f} (+{profit_pct:.2f}%) | Exit fee: ${exit_fee:.5f} (0%) | Bal: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[sym] = time.time()
 
-    def close_loss(self, sym, exit_price, reason):
+    def close_loss_market(self, sym, exit_price, reason):
+        """MARKET exit – 0.1% taker fee (only on losses)"""
         pos = self.positions.pop(sym)
         gross_exit = pos['qty'] * exit_price
         exit_fee = gross_exit * TAKER_FEE
@@ -318,10 +302,10 @@ class ProfitFocusedScalper:
                 asyncio.create_task(self.subscribe_depth(sym))
                 asyncio.create_task(self.subscribe_trade(sym))
 
-        print("\n⚡ PROFIT FOCUSED SCALPER – CORRECT FEE MATH")
-        print(f"   🔍 Iceberg | 🎭 Spoofing | 🌊 Sweep | 📊 Volume-weighted OFI")
-        print(f"   TP: 0.25% gross → 0.05% net after 0.2% fees | SL: 0.15%")
-        print(f"   OFI threshold: {CONFIG['OFI_THRESHOLD']} | Order size: ${CONFIG['ORDER_SIZE_USDT']}\n")
+        print("\n⚡ FIXED PROFIT SCALPER – LIMIT TP EXITS (0% FEE)")
+        print(f"   Market entry: 0.1% | Limit TP exit: 0% | Market SL: 0.1%")
+        print(f"   TP: 0.35% gross → 0.25% net | SL: 0.12% | OFI threshold: {CONFIG['OFI_THRESHOLD']}")
+        print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']}\n")
 
         last_ofi_print = 0
         last_refresh = time.time()
@@ -379,6 +363,6 @@ class ProfitFocusedScalper:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(ProfitFocusedScalper().run())
+        asyncio.run(FixedProfitScalper().run())
     except KeyboardInterrupt:
         print("\nShutdown complete")
