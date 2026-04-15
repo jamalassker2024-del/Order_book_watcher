@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-ULTRA‑FAST MARKET SCALPER – INSTANT FILL, HIGH FREQUENCY, EXPONENTIAL GROWTH
-- Market entry (0.1% fee) – never miss a trade
+ULTRA‑FAST MARKET SCALPER – TRADES ALL VOLATILE PAIRS SIMULTANEOUSLY
+- Market entry (instant fill, 0.1% fee)
 - Take-profit limit order (0% fee) at 0.12% gross → 0.02% net
 - Stop-loss market order (0.1% fee) at 0.08%
 - Trailing stop locks in profit
-- No timeouts – only price action closes trades
+- Lower OFI threshold (0.50) to catch more signals on all pairs
+- Concurrent trading on up to 5 symbols
 """
 
 import asyncio
@@ -24,14 +25,14 @@ CONFIG = {
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 5,
-    "OFI_THRESHOLD": Decimal("0.60"),          # Lowered to catch more signals
+    "OFI_THRESHOLD": Decimal("0.50"),          # Lowered – more signals on all pairs
     "TRADE_IMBALANCE_THRESHOLD": Decimal("0.3"),
-    "TAKE_PROFIT_BPS": Decimal("12"),          # 0.12% gross → net 0.02% after 0.1% entry fee
-    "STOP_LOSS_BPS": Decimal("8"),             # 0.08% loss (market exit, 0.1% fee)
+    "TAKE_PROFIT_BPS": Decimal("12"),          # 0.12% gross → net 0.02% after 0.1% fee
+    "STOP_LOSS_BPS": Decimal("8"),             # 0.08% loss (market exit)
     "TRAIL_ACTIVATE_BPS": Decimal("2"),        # start trailing after 0.02% profit
     "TRAIL_DISTANCE_BPS": Decimal("2"),        # trail 0.02% behind
     "WIN_COOLDOWN_SEC": 1,
-    "LOSS_COOLDOWN_SEC": 10,                   # shorter cooldown for more trades
+    "LOSS_COOLDOWN_SEC": 10,
     "SCAN_INTERVAL_MS": 10,                    # 10ms for ultra‑fast reaction
     "REFRESH_BOOK_SEC": 20,
     "BINANCE_WS_DEPTH": "wss://stream.binance.com:9443/ws",
@@ -260,7 +261,7 @@ class FastMarketScalper:
     def close_win(self, sym, price):
         pos = self.positions.pop(sym)
         gross = pos['qty'] * price
-        fee = gross * MAKER_FEE   # 0%
+        fee = gross * MAKER_FEE
         profit = gross - pos['order_size'] - fee
         self.balance += gross - fee
         self.total_trades += 1
@@ -312,7 +313,7 @@ class FastMarketScalper:
                 asyncio.create_task(self.subscribe_depth(sym))
                 asyncio.create_task(self.subscribe_trade(sym))
 
-        print("\n🚀 ULTRA‑FAST MARKET SCALPER – INSTANT FILL, HIGH FREQUENCY")
+        print("\n🚀 ULTRA‑FAST MARKET SCALPER – TRADING ALL PAIRS")
         print(f"   TP: 0.12% gross → 0.02% net | SL: 0.08% | Trail: 0.02% after 0.02% profit")
         print(f"   Position: ${CONFIG['ORDER_SIZE_USDT']} | Balance: ${self.balance}\n")
 
@@ -327,7 +328,7 @@ class FastMarketScalper:
                         await self.order_books[sym].refresh_snapshot(session)
                     last_refresh = now
 
-                if now - last_ofi_print > 2:   # print every 2 seconds
+                if now - last_ofi_print > 2:
                     ofi_str = []
                     for sym in CONFIG["SYMBOLS"]:
                         ofi = self.order_books[sym].get_ofi(CONFIG["DEPTH_LEVELS"])
