@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-INSTITUTIONAL HFT SCALPER – AGGRESSIVE ENTRY (NO BLOCKS)
+ULTRA AGGRESSIVE SCALPER – NO FILTERS, JUST PURE TRADING
+- NO EMA filter
+- NO spread filter
+- Lower OFI threshold (0.20)
 - Limit orders (0% maker fee)
-- NO spread filter – enters immediately
-- NO EMA trend filter – enters on any strong OFI
-- All other secret techniques preserved
-- Fast aggressive trading
+- All secret techniques preserved
+- ENTERS EVERY SIGNAL IMMEDIATELY
 """
 
 import asyncio
@@ -25,8 +26,7 @@ CONFIG = {
     "ORDER_SIZE_USDT": Decimal("10.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 8,
-    "OFI_THRESHOLD_BASE": Decimal("0.40"),
-    "MIN_OFI_THRESHOLD": Decimal("0.30"),
+    "OFI_THRESHOLD": Decimal("0.20"),           # Much lower – catches all signals
     "TAKE_PROFIT_BPS": Decimal("15"),
     "STOP_LOSS_BPS": Decimal("10"),
     "BREAKEVEN_ACTIVATE_BPS": Decimal("2"),
@@ -43,7 +43,7 @@ CONFIG = {
 TAKER_FEE = Decimal("0.001")
 MAKER_FEE = Decimal("0")
 
-class InstitutionalScalper:
+class UltraAggressiveScalper:
     def __init__(self):
         self.order_books = {}
         self.trade_flows = {}
@@ -209,17 +209,8 @@ class InstitutionalScalper:
         lows = min(prices[-10:])
         return (highs - lows) / lows if lows > 0 else Decimal('0.001')
 
-    def get_adaptive_threshold(self, symbol):
-        vol = self.get_current_volatility(symbol)
-        vol_bps = vol * 10000
-        if vol_bps > 30:
-            return CONFIG["MIN_OFI_THRESHOLD"]
-        adjustment = min(Decimal('0.15'), vol * Decimal('50'))
-        threshold = CONFIG["OFI_THRESHOLD_BASE"] - adjustment
-        return max(CONFIG["MIN_OFI_THRESHOLD"], min(Decimal('0.60'), threshold))
-
     def open_limit_position(self, symbol, side, reason=""):
-        """LIMIT ORDER – 0% maker fee! No filters, just enter!"""
+        """LIMIT ORDER – 0% maker fee! ENTERS IMMEDIATELY!"""
         book = self.order_books[symbol]
         
         # Use limit price at best bid (for buy) or best ask (for sell)
@@ -287,13 +278,13 @@ class InstitutionalScalper:
                 if gain_bps >= CONFIG["BREAKEVEN_ACTIVATE_BPS"] and not pos['breakeven_activated']:
                     pos['sl'] = pos['entry']
                     pos['breakeven_activated'] = True
-                    print(f"  🔒 Breakeven activated for {sym} (SL moved to entry)")
+                    print(f"  🔒 Breakeven activated for {sym}")
             else:
                 gain_bps = (pos['entry'] - mid) / pos['entry'] * 10000
                 if gain_bps >= CONFIG["BREAKEVEN_ACTIVATE_BPS"] and not pos['breakeven_activated']:
                     pos['sl'] = pos['entry']
                     pos['breakeven_activated'] = True
-                    print(f"  🔒 Breakeven activated for {sym} (SL moved to entry)")
+                    print(f"  🔒 Breakeven activated for {sym}")
 
             # Trailing stop (after breakeven)
             if pos['side'] == 'buy':
@@ -368,11 +359,12 @@ class InstitutionalScalper:
                 asyncio.create_task(self.subscribe_depth(sym))
                 asyncio.create_task(self.subscribe_trade(sym))
 
-        print("\n🏛️ INSTITUTIONAL HFT SCALPER – AGGRESSIVE ENTRY (NO BLOCKS)")
+        print("\n⚡ ULTRA AGGRESSIVE SCALPER – NO FILTERS, PURE TRADING")
         print(f"   🔍 Iceberg | 🎭 Spoofing | 🌊 Sweep | 📊 Volume-weighted OFI")
-        print(f"   🔄 Adaptive thresholds | 🎯 Trade tape confirmation")
-        print(f"   TP: 0.15% | SL: 0.10% | Order size: ${CONFIG['ORDER_SIZE_USDT']}")
-        print(f"   ⚡ ENTERING TRADES IMMEDIATELY – NO FILTERS\n")
+        print(f"   🎯 Trade tape confirmation (bonus only)")
+        print(f"   TP: 0.15% | SL: 0.10% | OFI threshold: {CONFIG['OFI_THRESHOLD']}")
+        print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']} | Limit orders (0% fee)")
+        print(f"   ⚡ ENTERING EVERY SIGNAL – NO BLOCKS\n")
 
         last_ofi_print = 0
         last_refresh = time.time()
@@ -389,8 +381,7 @@ class InstitutionalScalper:
                     ofi_str = []
                     for sym in CONFIG["SYMBOLS"]:
                         ofi = self.order_books[sym].get_volume_weighted_ofi(CONFIG["DEPTH_LEVELS"])
-                        thresh = self.get_adaptive_threshold(sym)
-                        ofi_str.append(f"{sym}:{ofi:.2f}({thresh:.2f})")
+                        ofi_str.append(f"{sym}:{ofi:.2f}")
                     print(f"🔍 OFI: {' | '.join(ofi_str)}")
                     last_ofi_print = now
 
@@ -405,7 +396,6 @@ class InstitutionalScalper:
 
                     ofi = self.order_books[sym].get_volume_weighted_ofi(CONFIG["DEPTH_LEVELS"])
                     trade_imb = self.trade_flows[sym].get_imbalance()
-                    threshold = self.get_adaptive_threshold(sym)
                     
                     # PRIORITY 1: Liquidity sweep (reversal trade)
                     sweep = self.trade_flows[sym].detect_liquidity_sweep()
@@ -417,15 +407,15 @@ class InstitutionalScalper:
                             self.open_limit_position(sym, 'buy', "[SWEEP]")
                         continue
 
-                    # PRIORITY 2: Strong OFI signal – ENTER IMMEDIATELY
-                    if abs(ofi) > threshold:
+                    # PRIORITY 2: OFI signal – ENTER IMMEDIATELY (NO FILTERS)
+                    if ofi > CONFIG["OFI_THRESHOLD"]:
                         bonus = "🔥" if abs(trade_imb) > Decimal('0.15') else ""
-                        if ofi > 0:
-                            print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → LIMIT BUY")
-                            self.open_limit_position(sym, 'buy', "[OFI]")
-                        elif ofi < 0:
-                            print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → LIMIT SELL")
-                            self.open_limit_position(sym, 'sell', "[OFI]")
+                        print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → LIMIT BUY")
+                        self.open_limit_position(sym, 'buy', "[OFI]")
+                    elif ofi < -CONFIG["OFI_THRESHOLD"]:
+                        bonus = "🔥" if abs(trade_imb) > Decimal('0.15') else ""
+                        print(f"⚡ {sym} OFI={ofi:.2f} {bonus} → LIMIT SELL")
+                        self.open_limit_position(sym, 'sell', "[OFI]")
 
                 if now - self.daily_start >= 86400:
                     print(f"\n💰 DAILY PROFIT: +${self.daily_profit:.5f} | Balance: ${self.balance:.2f}\n")
@@ -436,6 +426,6 @@ class InstitutionalScalper:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(InstitutionalScalper().run())
+        asyncio.run(UltraAggressiveScalper().run())
     except KeyboardInterrupt:
         print("\nShutdown complete")
