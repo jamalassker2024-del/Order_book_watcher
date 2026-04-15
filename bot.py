@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-ULTIMATE DYNAMIC SCALPER – OFI + TRADE TAPE + ORDER CHASER
-- Replaces rigid timeouts with a dynamic 'chasing' mechanism.
-- Stays at the front of the order book (Best Bid + 1 / Best Ask - 1).
-- Automatically pulls orders if the alpha signal decays.
-- $5 position size, $100 balance.
+FINAL HYBRID SCALPER – MARKET ENTRY FOR EXTREME SIGNALS, LIMIT FOR MODERATE
+- Market entry when OFI > 0.80 (instant, 0.1% fee)
+- Limit entry when 0.55 < OFI ≤ 0.80 (0% fee, 0.5s timeout, fallback to market)
+- Trade tape confirmation (OFI + taker imbalance)
+- Take-profit limit exit (0% fee)
+- Trailing stop (locks profit, no timeout)
 """
 
 import asyncio
@@ -23,12 +24,14 @@ CONFIG = {
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 5,
-    "OFI_THRESHOLD": Decimal("0.55"),
+    "OFI_LIMIT_THRESHOLD": Decimal("0.55"),
+    "OFI_MARKET_THRESHOLD": Decimal("0.80"),
     "TRADE_IMBALANCE_THRESHOLD": Decimal("0.3"),
-    "TAKE_PROFIT_BPS": Decimal("2"),               # 0.02% pure profit
-    "STOP_LOSS_BPS": Decimal("4"),                 # 0.04% initial stop
-    "TRAIL_ACTIVATE_BPS": Decimal("1"),            # start trailing after 0.01% profit
-    "TRAIL_DISTANCE_BPS": Decimal("1"),            # trail 0.01% behind
+    "TAKE_PROFIT_BPS": Decimal("2"),           # 0.02% pure profit (limit exit)
+    "STOP_LOSS_BPS": Decimal("4"),             # 0.04% initial stop (market exit)
+    "TRAIL_ACTIVATE_BPS": Decimal("1"),        # start trailing after 0.01% profit
+    "TRAIL_DISTANCE_BPS": Decimal("1"),        # trail 0.01% behind
+    "LIMIT_TIMEOUT_SEC": 0.5,                  # cancel limit order after 0.5s
     "WIN_COOLDOWN_SEC": 1,
     "LOSS_COOLDOWN_SEC": 15,
     "SCAN_INTERVAL_MS": 20,
@@ -37,10 +40,10 @@ CONFIG = {
     "BINANCE_WS_TRADE": "wss://stream.binance.com:9443/ws",
 }
 
-TAKER_FEE = Decimal("0.001")   # Market exit
-MAKER_FEE = Decimal("0")       # Limit entry/TP
+TAKER_FEE = Decimal("0.001")   # market entry & stop loss
+MAKER_FEE = Decimal("0")       # limit entry & TP
 
-class UltimateScalper:
+class HybridScalper:
     def __init__(self):
         self.order_books = {}
         self.trade_flows = {}
@@ -55,7 +58,7 @@ class UltimateScalper:
         self.last_trade_result = {}
         self.running = True
 
-    # ---------- Order Book Internal Class ----------
+    # ---------- Order Book ----------
     class OrderBook:
         def __init__(self, symbol):
             self.symbol = symbol
@@ -79,6 +82,10 @@ class UltimateScalper:
 
         def best_ask(self):
             return min(self.asks.keys()) if self.asks else Decimal('0')
+
+        def mid_price(self):
+            bb, ba = self.best_bid(), self.best_ask()
+            return (bb + ba) / 2 if bb and ba else Decimal('0')
 
         def tick_size(self):
             if self.bids:
@@ -105,8 +112,10 @@ class UltimateScalper:
                     self.asks = {Decimal(p): Decimal(q) for p, q in data['asks']}
                     self.last_update = time.time()
                     return True
-            except: return False
+            except Exception:
+                return False
 
+    # ---------- Trade Flow ----------
     class TradeFlow:
         def __init__(self, symbol):
             self.symbol = symbol
@@ -117,221 +126,321 @@ class UltimateScalper:
 
         def add_trade(self, is_buyer_maker, qty, price):
             volume = qty * price
-            if is_buyer_maker: self.sell_volume += volume
-            else: self.buy_volume += volume
+            if is_buyer_maker:
+                self.sell_volume += volume
+            else:
+                self.buy_volume += volume
             now = time.time()
             if now - self.last_reset > self.window_sec:
-                self.buy_volume = self.sell_volume = Decimal('0')
+                self.buy_volume = Decimal('0')
+                self.sell_volume = Decimal('0')
                 self.last_reset = now
 
         def get_imbalance(self):
             total = self.buy_volume + self.sell_volume
-            return (self.buy_volume - self.sell_volume) / total if total > 0 else Decimal('0')
+            if total == 0:
+                return Decimal('0')
+            return (self.buy_volume - self.sell_volume) / total
 
-    # ---------- Logic Core ----------
+    # ---------- WebSocket Subscriptions ----------
+    async def subscribe_depth(self, symbol):
+        stream = f"{symbol.lower()}@depth20@100ms"
+        url = f"{CONFIG['BINANCE_WS_DEPTH']}/{stream}"
+        while self.running:
+            try:
+                async with websockets.connect(url) as ws:
+                    async for msg in ws:
+                        data = json.loads(msg)
+                        if 'b' in data or 'a' in data:
+                            self.order_books[symbol].apply_depth(data)
+            except Exception:
+                await asyncio.sleep(3)
 
-    def place_entry_limit(self, symbol, side):
+    async def subscribe_trade(self, symbol):
+        stream = f"{symbol.lower()}@trade"
+        url = f"{CONFIG['BINANCE_WS_TRADE']}/{stream}"
+        while self.running:
+            try:
+                async with websockets.connect(url) as ws:
+                    async for msg in ws:
+                        data = json.loads(msg)
+                        if 'p' in data and 'q' in data:
+                            price = Decimal(data['p'])
+                            qty = Decimal(data['q'])
+                            is_buyer_maker = data.get('m', False)
+                            self.trade_flows[symbol].add_trade(is_buyer_maker, qty, price)
+            except Exception:
+                await asyncio.sleep(3)
+
+    # ---------- Entry Methods ----------
+    def open_market_position(self, symbol, side):
+        """Market entry – instant fill, pays 0.1% fee"""
         book = self.order_books[symbol]
-        price = self._calculate_chase_price(symbol, side)
-        
-        if price <= 0: return
+        price = book.best_ask() if side == 'buy' else book.best_bid()
+        if price <= 0:
+            return False
 
         order_size = CONFIG["ORDER_SIZE_USDT"]
         if order_size > self.balance:
             order_size = self.balance * Decimal("0.95")
-            if order_size < Decimal("1.00"): return
+            if order_size < Decimal("1.00"):
+                return False
 
+        qty = order_size / price
+        cost = qty * price
+        fee = cost * TAKER_FEE
+
+        if cost + fee > self.balance:
+            return False
+
+        self.balance -= (cost + fee)
+
+        tp_bps = CONFIG["TAKE_PROFIT_BPS"]
+        sl_bps = CONFIG["STOP_LOSS_BPS"]
+        trail_bps = CONFIG["TRAIL_ACTIVATE_BPS"]
+        trail_dist = CONFIG["TRAIL_DISTANCE_BPS"]
+
+        if side == 'buy':
+            target_price = price * (1 + tp_bps/10000)
+            stop_price = price * (1 - sl_bps/10000)
+        else:
+            target_price = price * (1 - tp_bps/10000)
+            stop_price = price * (1 + sl_bps/10000)
+
+        self.positions[symbol] = {
+            'side': side,
+            'entry': price,
+            'qty': qty,
+            'order_size': order_size,
+            'tp': target_price,
+            'sl': stop_price,
+            'best_price': price,
+            'trailing': False,
+            'entry_time': time.time()
+        }
+
+        net_profit = order_size * tp_bps/10000 - order_size * TAKER_FEE
+        print(f"⚡ MARKET {side.upper()} {symbol} @ {price:.8f} | ${order_size:.2f} | Target net: +${net_profit:.4f}")
+        return True
+
+    def place_entry_limit(self, symbol, side):
+        """Limit entry – 0% fee, with timeout"""
+        book = self.order_books[symbol]
+        if side == 'buy':
+            price = book.best_bid() + book.tick_size()
+            if price >= book.best_ask():
+                price = book.best_ask() - book.tick_size()
+        else:
+            price = book.best_ask() - book.tick_size()
+            if price <= book.best_bid():
+                price = book.best_bid() + book.tick_size()
+        if price <= 0:
+            return False
+
+        order_size = CONFIG["ORDER_SIZE_USDT"]
+        if order_size > self.balance:
+            order_size = self.balance * Decimal("0.95")
+            if order_size < Decimal("1.00"):
+                return False
+
+        qty = order_size / price
         self.pending_entries[symbol] = {
             'side': side,
             'price': price,
-            'qty': order_size / price,
+            'qty': qty,
             'order_size': order_size,
             'timestamp': time.time()
         }
-        print(f"📝 LIMIT {side.upper()} Posted: {symbol} @ {price:.8f}")
+        print(f"📝 LIMIT {side.upper()} {symbol} @ {price:.8f} (0% fee)")
+        return True
 
-    def _calculate_chase_price(self, symbol, side):
-        book = self.order_books[symbol]
-        tick = book.tick_size()
-        if side == 'buy':
-            price = book.best_bid() + tick
-            return min(price, book.best_ask() - tick)
-        else:
-            price = book.best_ask() - tick
-            return max(price, book.best_bid() + tick)
-
-    def check_fills_and_positions(self):
+    def check_entries_and_positions(self):
         now = time.time()
 
-        # 1. SMART ORDER CHASING
+        # 1. Check pending limit entries
         for sym in list(self.pending_entries.keys()):
             order = self.pending_entries[sym]
             book = self.order_books[sym]
-            
             filled = (order['side'] == 'buy' and book.best_ask() <= order['price']) or \
                      (order['side'] == 'sell' and book.best_bid() >= order['price'])
-            
             if filled:
-                self._create_position(sym, order)
-                continue
-
-            # Check if signal is still valid (Alpha Decay)
-            action, ofi, imb = self.entry_signal(sym)
-            if action != order['side']:
+                # Convert to position
+                tp = order['price'] * (1 + CONFIG["TAKE_PROFIT_BPS"]/10000) if order['side'] == 'buy' else order['price'] * (1 - CONFIG["TAKE_PROFIT_BPS"]/10000)
+                sl = order['price'] * (1 - CONFIG["STOP_LOSS_BPS"]/10000) if order['side'] == 'buy' else order['price'] * (1 + CONFIG["STOP_LOSS_BPS"]/10000)
+                self.balance -= order['order_size']
+                self.positions[sym] = {
+                    'side': order['side'],
+                    'entry': order['price'],
+                    'qty': order['qty'],
+                    'order_size': order['order_size'],
+                    'tp': tp,
+                    'sl': sl,
+                    'best_price': order['price'],
+                    'trailing': False,
+                    'entry_time': now
+                }
                 del self.pending_entries[sym]
-                print(f"📉 SIGNAL DECAY: {sym} cancelled (Alpha vanished)")
-                continue
+                print(f"✅ FILLED LIMIT {sym} @ {order['price']:.8f} | TP @ {tp:.8f}")
+            elif now - order['timestamp'] > CONFIG["LIMIT_TIMEOUT_SEC"]:
+                # Timeout – check if signal still strong; if yes, upgrade to market
+                action, ofi, imb = self.entry_signal(sym)
+                if action == order['side'] and ofi > CONFIG["OFI_MARKET_THRESHOLD"]:
+                    print(f"⏰ LIMIT TIMEOUT {sym} → upgrading to MARKET {order['side'].upper()}")
+                    self.open_market_position(sym, order['side'])
+                else:
+                    print(f"⌛ LIMIT TIMEOUT {sym} cancelled (signal weak)")
+                del self.pending_entries[sym]
 
-            # Update price if market moved (Chasing)
-            new_price = self._calculate_chase_price(sym, order['side'])
-            if new_price != order['price']:
-                self.pending_entries[sym]['price'] = new_price
-                print(f"🔄 CHASING {sym}: Moving limit to {new_price:.8f}")
-
-        # 2. POSITION MANAGEMENT
+        # 2. Manage open positions (trailing stop, TP, SL)
         for sym, pos in list(self.positions.items()):
             book = self.order_books[sym]
-            best_bid, best_ask = book.best_bid(), book.best_ask()
-            if best_bid <= 0 or best_ask <= 0: continue
-            mid = (best_bid + best_ask) / 2
+            mid = book.mid_price()
+            if mid <= 0:
+                continue
 
-            # Trailing Stop
-            self._update_trailing_stop(sym, pos, mid)
+            # Trailing stop
+            if pos['side'] == 'buy':
+                if mid > pos['best_price']:
+                    pos['best_price'] = mid
+                    gain_bps = (mid - pos['entry']) / pos['entry'] * 10000
+                    if gain_bps >= CONFIG["TRAIL_ACTIVATE_BPS"]:
+                        pos['trailing'] = True
+                    if pos['trailing']:
+                        new_sl = mid * (1 - CONFIG["TRAIL_DISTANCE_BPS"]/10000)
+                        if new_sl > pos['sl']:
+                            pos['sl'] = new_sl
+                            print(f"  🔼 Trail {sym}: SL moved to {new_sl:.8f}")
+            else:
+                if mid < pos['best_price']:
+                    pos['best_price'] = mid
+                    gain_bps = (pos['entry'] - mid) / pos['entry'] * 10000
+                    if gain_bps >= CONFIG["TRAIL_ACTIVATE_BPS"]:
+                        pos['trailing'] = True
+                    if pos['trailing']:
+                        new_sl = mid * (1 + CONFIG["TRAIL_DISTANCE_BPS"]/10000)
+                        if new_sl < pos['sl']:
+                            pos['sl'] = new_sl
+                            print(f"  🔽 Trail {sym}: SL moved to {new_sl:.8f}")
 
-            # Exits
+            # Take profit (limit exit, 0% fee)
             hit_tp = (pos['side'] == 'buy' and mid >= pos['tp']) or \
                      (pos['side'] == 'sell' and mid <= pos['tp'])
+            # Stop loss (market exit, 0.1% fee)
             hit_sl = (pos['side'] == 'buy' and mid <= pos['sl']) or \
                      (pos['side'] == 'sell' and mid >= pos['sl'])
 
             if hit_tp:
                 self.close_win(sym, pos['tp'])
             elif hit_sl:
-                exit_price = best_bid if pos['side'] == 'buy' else best_ask
+                exit_price = book.best_bid() if pos['side'] == 'buy' else book.best_ask()
                 self.close_loss(sym, exit_price, "STOP LOSS")
-
-    def _create_position(self, sym, order):
-        tp_mult = (1 + CONFIG["TAKE_PROFIT_BPS"]/10000) if order['side'] == 'buy' else (1 - CONFIG["TAKE_PROFIT_BPS"]/10000)
-        sl_mult = (1 - CONFIG["STOP_LOSS_BPS"]/10000) if order['side'] == 'buy' else (1 + CONFIG["STOP_LOSS_BPS"]/10000)
-        
-        self.balance -= order['order_size']
-        self.positions[sym] = {
-            'side': order['side'], 'entry': order['price'], 'qty': order['qty'],
-            'order_size': order['order_size'], 'tp': order['price'] * tp_mult,
-            'sl': order['price'] * sl_mult, 'best_price': order['price'],
-            'trailing': False, 'time': time.time()
-        }
-        del self.pending_entries[sym]
-        print(f"✅ FILLED {sym} @ {order['price']:.8f} | TP @ {self.positions[sym]['tp']:.8f}")
-
-    def _update_trailing_stop(self, sym, pos, mid):
-        if pos['side'] == 'buy':
-            if mid > pos['best_price']:
-                pos['best_price'] = mid
-                if (mid - pos['entry']) / pos['entry'] * 10000 >= CONFIG["TRAIL_ACTIVATE_BPS"]:
-                    pos['trailing'] = True
-                if pos['trailing']:
-                    new_sl = mid * (1 - CONFIG["TRAIL_DISTANCE_BPS"]/10000)
-                    pos['sl'] = max(pos['sl'], new_sl)
-        else:
-            if mid < pos['best_price']:
-                pos['best_price'] = mid
-                if (pos['entry'] - mid) / pos['entry'] * 10000 >= CONFIG["TRAIL_ACTIVATE_BPS"]:
-                    pos['trailing'] = True
-                if pos['trailing']:
-                    new_sl = mid * (1 + CONFIG["TRAIL_DISTANCE_BPS"]/10000)
-                    pos['sl'] = min(pos['sl'], new_sl)
-
-    # ---------- Common Methods ----------
 
     def close_win(self, sym, price):
         pos = self.positions.pop(sym)
-        profit = (pos['qty'] * price) - pos['order_size']
-        self.balance += (pos['qty'] * price)
+        gross = pos['qty'] * price
+        fee = gross * MAKER_FEE   # 0%
+        profit = gross - pos['order_size'] - fee
+        self.balance += gross - fee
         self.total_trades += 1
         self.winning_trades += 1
         self.last_trade_result[sym] = 'win'
         self.daily_profit += profit
-        print(f"💰 WIN {sym}: +${profit:.4f} | Balance: ${self.balance:.2f}")
+        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
+        profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
+        print(f"✅ WIN {sym} (TP LIMIT) | Profit: ${profit:.4f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[sym] = time.time()
 
     def close_loss(self, sym, price, reason):
         pos = self.positions.pop(sym)
         gross = pos['qty'] * price
         fee = gross * TAKER_FEE
-        profit = (gross - pos['order_size']) - fee
-        self.balance += (gross - fee)
+        profit = gross - pos['order_size'] - fee
+        self.balance += gross - fee
         self.total_trades += 1
-        self.last_trade_result[sym] = 'loss' if profit < 0 else 'win'
-        if profit > 0: self.winning_trades += 1
+        if profit > 0:
+            self.winning_trades += 1
+            self.last_trade_result[sym] = 'win'
+        else:
+            self.last_trade_result[sym] = 'loss'
         self.daily_profit += profit
-        print(f"🛑 {reason} {sym}: ${profit:.4f} | Balance: ${self.balance:.2f}")
+        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
+        profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
+        print(f"{'✅' if profit>0 else '❌'} {reason} {sym} | Profit: ${profit:.4f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[sym] = time.time()
 
+    # ---------- Combined Signal ----------
     def entry_signal(self, sym):
         book = self.order_books[sym]
         ofi = book.get_ofi(CONFIG["DEPTH_LEVELS"])
-        trade_imb = self.trade_flows[sym].get_imbalance()
-        if ofi > CONFIG["OFI_THRESHOLD"] and trade_imb > CONFIG["TRADE_IMBALANCE_THRESHOLD"]:
-            return 'buy', ofi, trade_imb
-        if ofi < -CONFIG["OFI_THRESHOLD"] and trade_imb < -CONFIG["TRADE_IMBALANCE_THRESHOLD"]:
-            return 'sell', ofi, trade_imb
-        return None, ofi, trade_imb
+        imb = self.trade_flows[sym].get_imbalance()
+        if ofi > CONFIG["OFI_LIMIT_THRESHOLD"] and imb > CONFIG["TRADE_IMBALANCE_THRESHOLD"]:
+            return 'buy', ofi, imb
+        if ofi < -CONFIG["OFI_LIMIT_THRESHOLD"] and imb < -CONFIG["TRADE_IMBALANCE_THRESHOLD"]:
+            return 'sell', ofi, imb
+        return None, ofi, imb
 
-    # ---------- Infrastructure ----------
-
-    async def subscribe_depth(self, symbol):
-        url = f"{CONFIG['BINANCE_WS_DEPTH']}/{symbol.lower()}@depth20@100ms"
-        while self.running:
-            try:
-                async with websockets.connect(url) as ws:
-                    async for msg in ws:
-                        data = json.loads(msg)
-                        if 'b' in data: self.order_books[symbol].apply_depth(data)
-            except: await asyncio.sleep(2)
-
-    async def subscribe_trade(self, symbol):
-        url = f"{CONFIG['BINANCE_WS_TRADE']}/{symbol.lower()}@trade"
-        while self.running:
-            try:
-                async with websockets.connect(url) as ws:
-                    async for msg in ws:
-                        data = json.loads(msg)
-                        self.trade_flows[symbol].add_trade(data.get('m', False), Decimal(data['q']), Decimal(data['p']))
-            except: await asyncio.sleep(2)
-
+    # ---------- Main Loop ----------
     async def run(self):
         async with aiohttp.ClientSession() as session:
             for sym in CONFIG["SYMBOLS"]:
                 self.order_books[sym] = self.OrderBook(sym)
                 await self.order_books[sym].refresh_snapshot(session)
                 self.trade_flows[sym] = self.TradeFlow(sym)
+                print(f"✅ {sym} ready")
                 asyncio.create_task(self.subscribe_depth(sym))
                 asyncio.create_task(self.subscribe_trade(sym))
 
+        print("\n🚀 HYBRID SCALPER – MARKET (extreme) + LIMIT (moderate)")
+        print(f"   Limit threshold: {CONFIG['OFI_LIMIT_THRESHOLD']} | Market threshold: {CONFIG['OFI_MARKET_THRESHOLD']}")
+        print(f"   TP: 0.02% pure profit | SL: 0.04% | Trail: 0.01% after 0.01% gain")
+        print(f"   Position: ${CONFIG['ORDER_SIZE_USDT']} | Balance: ${self.balance}\n")
+
+        last_ofi_print = 0
         last_refresh = time.time()
-        while self.running:
-            now = time.time()
-            if now - last_refresh > CONFIG["REFRESH_BOOK_SEC"]:
-                async with aiohttp.ClientSession() as session:
-                    for sym in CONFIG["SYMBOLS"]: await self.order_books[sym].refresh_snapshot(session)
-                last_refresh = now
+        async with aiohttp.ClientSession() as session:
+            while self.running:
+                now = time.time()
 
-            self.check_fills_and_positions()
+                if now - last_refresh > CONFIG["REFRESH_BOOK_SEC"]:
+                    for sym in CONFIG["SYMBOLS"]:
+                        await self.order_books[sym].refresh_snapshot(session)
+                    last_refresh = now
 
-            for sym in CONFIG["SYMBOLS"]:
-                if sym in self.positions or sym in self.pending_entries: continue
-                
-                cooldown = CONFIG["LOSS_COOLDOWN_SEC"] if self.last_trade_result.get(sym) == 'loss' else CONFIG["WIN_COOLDOWN_SEC"]
-                if sym in self.last_trade_time and now - self.last_trade_time[sym] < cooldown: continue
-                
-                action, ofi, imb = self.entry_signal(sym)
-                if action: self.place_entry_limit(sym, action)
+                if now - last_ofi_print > 3:
+                    ofi_str = []
+                    for sym in CONFIG["SYMBOLS"]:
+                        ofi = self.order_books[sym].get_ofi(CONFIG["DEPTH_LEVELS"])
+                        imb = self.trade_flows[sym].get_imbalance()
+                        ofi_str.append(f"{sym}:{ofi:.2f}/{imb:.2f}")
+                    print(f"🔍 OFI/IMB: {' | '.join(ofi_str)}")
+                    last_ofi_print = now
 
-            await asyncio.sleep(CONFIG["SCAN_INTERVAL_MS"] / 1000.0)
+                self.check_entries_and_positions()
+
+                for sym in CONFIG["SYMBOLS"]:
+                    if sym in self.positions or sym in self.pending_entries:
+                        continue
+                    cooldown = CONFIG["LOSS_COOLDOWN_SEC"] if self.last_trade_result.get(sym) == 'loss' else CONFIG["WIN_COOLDOWN_SEC"]
+                    if sym in self.last_trade_time and now - self.last_trade_time[sym] < cooldown:
+                        continue
+                    action, ofi, imb = self.entry_signal(sym)
+                    if action:
+                        if ofi > CONFIG["OFI_MARKET_THRESHOLD"]:
+                            print(f"⚡ {sym} OFI={ofi:.2f} IMB={imb:.2f} → MARKET {action.upper()} (extreme)")
+                            self.open_market_position(sym, action)
+                        else:
+                            print(f"📝 {sym} OFI={ofi:.2f} IMB={imb:.2f} → LIMIT {action.upper()}")
+                            self.place_entry_limit(sym, action)
+
+                if now - self.daily_start >= 86400:
+                    print(f"\n💰 DAILY PROFIT: +${self.daily_profit:.4f} | Balance: ${self.balance:.2f}\n")
+                    self.daily_profit = Decimal('0')
+                    self.daily_start = now
+
+                await asyncio.sleep(CONFIG["SCAN_INTERVAL_MS"] / 1000.0)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(UltimateScalper().run())
+        asyncio.run(HybridScalper().run())
     except KeyboardInterrupt:
         print("\nShutdown complete")
