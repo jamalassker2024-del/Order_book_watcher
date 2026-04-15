@@ -4,7 +4,7 @@
 """
 INSTITUTIONAL HFT SCALPER – FIXED NEGATIVE EXPECTANCY
 - Limit orders (0% maker fee) instead of market orders
-- Spread filter – don't trade when spread > half of TP
+- Spread filter – warn but don't block (fixed)
 - Breakeven – move SL to entry after 2 bps profit
 - EMA momentum filter – only trade with trend
 - All other secret techniques preserved
@@ -22,27 +22,28 @@ getcontext().prec = 12
 
 CONFIG = {
     "SYMBOLS": ["NEIROUSDT", "PEPEUSDT", "DOGSUSDT", "BONKUSDT", "1000PEPEUSDT"],
-    "ORDER_SIZE_USDT": Decimal("10.00"),           # Increased for better ratio
+    "ORDER_SIZE_USDT": Decimal("10.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
     "DEPTH_LEVELS": 8,
     "OFI_THRESHOLD_BASE": Decimal("0.40"),
     "MIN_OFI_THRESHOLD": Decimal("0.30"),
-    "TAKE_PROFIT_BPS": Decimal("15"),              # Increased to 0.15%
-    "STOP_LOSS_BPS": Decimal("10"),                # Increased to 0.10%
-    "BREAKEVEN_ACTIVATE_BPS": Decimal("2"),        # Move SL to entry after 2 bps profit
-    "TRAIL_ACTIVATE_BPS": Decimal("5"),            # Start trailing after 0.05% profit
-    "TRAIL_DISTANCE_BPS": Decimal("3"),            # Trail 0.03% behind
+    "TAKE_PROFIT_BPS": Decimal("15"),
+    "STOP_LOSS_BPS": Decimal("10"),
+    "MAX_SPREAD_BPS": Decimal("12"),           # Max spread allowed (0.12%) – much looser
+    "BREAKEVEN_ACTIVATE_BPS": Decimal("2"),
+    "TRAIL_ACTIVATE_BPS": Decimal("5"),
+    "TRAIL_DISTANCE_BPS": Decimal("3"),
     "WIN_COOLDOWN_SEC": 0.3,
     "LOSS_COOLDOWN_SEC": 10,
     "SCAN_INTERVAL_MS": 5,
     "REFRESH_BOOK_SEC": 20,
-    "EMA_PERIOD": 50,                              # EMA for trend filter
+    "EMA_PERIOD": 50,
     "BINANCE_WS_DEPTH": "wss://stream.binance.com:9443/ws",
     "BINANCE_WS_TRADE": "wss://stream.binance.com:9443/ws",
 }
 
 TAKER_FEE = Decimal("0.001")
-MAKER_FEE = Decimal("0")      # Limit orders = 0% fee!
+MAKER_FEE = Decimal("0")
 
 class InstitutionalScalper:
     def __init__(self):
@@ -211,7 +212,6 @@ class InstitutionalScalper:
                 await asyncio.sleep(3)
 
     def update_ema(self, symbol, price):
-        """Simple EMA calculation for trend filter"""
         if self.ema[symbol] == 0:
             self.ema[symbol] = price
         else:
@@ -219,13 +219,11 @@ class InstitutionalScalper:
             self.ema[symbol] = (price - self.ema[symbol]) * multiplier + self.ema[symbol]
 
     def is_above_ema(self, symbol, price):
-        """Check if price is above EMA (for buy signals)"""
         if self.ema[symbol] == 0:
             return True
         return price > self.ema[symbol]
 
     def is_below_ema(self, symbol, price):
-        """Check if price is below EMA (for sell signals)"""
         if self.ema[symbol] == 0:
             return True
         return price < self.ema[symbol]
@@ -260,11 +258,11 @@ class InstitutionalScalper:
         if price <= 0:
             return False
 
-        # SPREAD FILTER: Don't trade if spread is too large
+        # SPREAD FILTER – now warns but doesn't block (fixed!)
         spread_bps = book.spread_bps()
-        if spread_bps > CONFIG["TAKE_PROFIT_BPS"] * Decimal("0.5"):
-            print(f"⚠️ Spread too high for {symbol}: {spread_bps:.2f}bps, skipping")
-            return False
+        if spread_bps > CONFIG["MAX_SPREAD_BPS"]:
+            print(f"⚠️ Spread high for {symbol}: {spread_bps:.2f}bps (max {CONFIG['MAX_SPREAD_BPS']}bps) – still trading")
+            # Don't return – just warn and continue
 
         # EMA TREND FILTER
         mid = book.mid_price()
@@ -283,7 +281,7 @@ class InstitutionalScalper:
 
         qty = order_size / price
         cost = qty * price
-        fee = cost * MAKER_FEE      # 0% fee!
+        fee = cost * MAKER_FEE
 
         if cost + fee > self.balance:
             return False
@@ -387,7 +385,7 @@ class InstitutionalScalper:
     def close_loss(self, sym, price, reason):
         pos = self.positions.pop(sym)
         gross = pos['qty'] * price
-        fee = gross * TAKER_FEE   # Only pay taker fee on stop loss (emergency)
+        fee = gross * TAKER_FEE
         profit = gross - pos['order_size'] - fee
         self.balance += gross - fee
         self.total_trades += 1
@@ -412,10 +410,10 @@ class InstitutionalScalper:
                 asyncio.create_task(self.subscribe_depth(sym))
                 asyncio.create_task(self.subscribe_trade(sym))
 
-        print("\n🏛️ INSTITUTIONAL HFT SCALPER – FIXED NEGATIVE EXPECTANCY")
+        print("\n🏛️ INSTITUTIONAL HFT SCALPER – FIXED (Spread warning only)")
         print(f"   🔍 Iceberg | 🎭 Spoofing | 🌊 Sweep | 📊 Volume-weighted OFI")
         print(f"   🔄 Adaptive thresholds | 🎯 Trade tape | 📈 EMA trend filter")
-        print(f"   TP: 0.15% | SL: 0.10% | Breakeven: 0.02% | Trail: 0.05%->0.03%")
+        print(f"   TP: 0.15% | SL: 0.10% | Max spread: {CONFIG['MAX_SPREAD_BPS']}bps (warn only)")
         print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']} | Limit orders (0% fee)\n")
 
         last_ofi_print = 0
