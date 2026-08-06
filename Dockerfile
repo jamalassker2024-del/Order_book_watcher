@@ -26,7 +26,7 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //|                                                      Flow Trader  |
 //+------------------------------------------------------------------+
 #property copyright "LiquiditySweep EA"
-#property version   "1.01"
+#property version   "1.02"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -35,7 +35,6 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 
 CTrade obj_Trade;
 CAccountInfo obj_Account;
-CSymbolInfo obj_Symbol;
 
 //+------------------------------------------------------------------+
 //| Input Parameters                                                  |
@@ -46,12 +45,12 @@ input double   MaxDailyLossPct  = 10.0;       // Max daily loss (%)
 input double   MaxDrawdownPct   = 20.0;       // Max account drawdown (%)
 input int      MaxPositions     = 2;          // Maximum concurrent positions
 
-//--- Entry Settings (Relaxed for Active Trading) ---
-input int      LookbackCandles  = 5;          // Candles to scan for liquidity (5-10)
-input int      MinVolumeRatio   = 100;        // Min volume ratio to average (%) [Was 150]
-input int      MinBodyPercent   = 20;         // Min body % of candle range [Was 60]
-input double   MinATR           = 50.0;       // Minimum ATR in points [Was 200]
-input int      CooldownBars     = 1;          // Cooldown after exit (bars) [Was 3]
+//--- Entry Settings ---
+input int      LookbackCandles  = 7;          // Candles to scan for liquidity (5-10)
+input int      MinVolumeRatio   = 150;        // Min volume ratio to average (%)
+input int      MinBodyPercent   = 60;         // Min body % of candle range
+input double   MinATR           = 200.0;      // Minimum ATR in points
+input int      CooldownBars     = 3;          // Cooldown after exit (bars)
 
 //--- Exit Settings ---
 input double   ATRMultiplierSL  = 1.5;        // ATR multiplier for SL
@@ -68,38 +67,6 @@ input int      SlippagePts      = 50;         // Slippage tolerance
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
 //+------------------------------------------------------------------+
-//--- Time & Bar Tracking ---
-datetime lastBarTime = 0;
-datetime lastTradeTime = 0;
-int barsSinceLastTrade = 0;
-
-//--- Balance Tracking ---
-double dailyStartBalance = 0;
-double peakBalance = 0;
-double dailyLoss = 0;
-double currentDrawdown = 0;
-
-//--- ATR & Volume ---
-double currentATR = 0;
-double avgVolume = 0;
-
-//--- Order Tracking ---
-int totalTradesToday = 0;
-int consecutiveLosses = 0;
-
-//--- Broker Detection ---
-int minStopLevel = 0;
-double lotStep = 0;
-double lotMin = 0;
-long fillMode = 0;
-
-//--- Performance Stats ---
-int totalTrades = 0;
-int winningTrades = 0;
-int losingTrades = 0;
-double totalProfit = 0;
-
-//--- Top 20 Crypto Symbols ---
 string Top20CryptoSymbols[20] = {
    "BTCUSD", "ETHUSD", "USDTUSD", "BNBUSD", "SOLUSD", 
    "USDCUSD", "XRPUSD", "ADAUSD", "AVAXUSD", "DOGEUSD", 
@@ -107,97 +74,54 @@ string Top20CryptoSymbols[20] = {
    "SHIBUSD", "LTCUSD", "BCHUSD", "UNIUSD", "ATOMUSD"
 };
 
+//--- Multi-Symbol Tracking ---
+datetime lastBarTime[20] = {0};
+int barsSinceLastTrade[20] = {0};
+
+//--- Balance Tracking ---
+double dailyStartBalance = 0;
+double peakBalance = 0;
+double dailyLoss = 0;
+double currentDrawdown = 0;
+
+//--- Order Tracking ---
+int totalTradesToday = 0;
+int consecutiveLosses = 0;
+
+//--- Performance Stats ---
+int totalTrades = 0;
+int winningTrades = 0;
+int losingTrades = 0;
+double totalProfit = 0;
+
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit() {
    Print("═══════════════════════════════════════════════════════════");
-   Print("  LIQUIDITY SWEEP + ORDER FLOW EA v1.01 (Relaxed Rules)");
+   Print("  LIQUIDITY SWEEP + ORDER FLOW EA v1.02");
+   Print("  Multi-Asset Matrix - Top 20 Crypto Scanner");
    Print("═══════════════════════════════════════════════════════════");
    
-   //--- Initialize Objects ---
    obj_Trade.SetExpertMagicNumber(MagicNumber);
    obj_Trade.SetDeviationInPoints(SlippagePts);
    
-   //--- Get Symbol Info ---
-   obj_Symbol.Name(_Symbol);
-   obj_Symbol.Refresh();
-   
-   //--- Detect Broker Settings ---
-   DetectBrokerSettings();
-   
-   //--- Initialize Balance Tracking ---
    dailyStartBalance = obj_Account.Balance();
    peakBalance = dailyStartBalance;
    
-   //--- Print Configuration ---
-   PrintConfiguration();
+   // Initialize arrays and add symbols to Market Watch
+   for(int i = 0; i < 20; i++) {
+      barsSinceLastTrade[i] = CooldownBars + 1; // Allows immediate trading
+      SymbolSelect(Top20CryptoSymbols[i], true);
+   }
    
    return(INIT_SUCCEEDED);
-}
-
-//+------------------------------------------------------------------+
-//| Detect Broker Settings Function                                  |
-//+------------------------------------------------------------------+
-void DetectBrokerSettings() {
-   //--- Minimum Stop Level ---
-   minStopLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   if (minStopLevel == 0) {
-      minStopLevel = 100;  
-      Print("[WARNING] Broker stop level not reported, using default: ", minStopLevel);
-   }
-   
-   //--- Lot Step ---
-   lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   if (lotStep == 0) lotStep = 0.01;
-   
-   //--- Lot Min ---
-   lotMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   if (lotMin == 0) lotMin = 0.01;
-   
-   //--- Fill Mode ---
-   uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
-   if((filling & SYMBOL_FILLING_FOK) != 0) {
-      obj_Trade.SetTypeFilling(ORDER_FILLING_FOK);
-   } else if((filling & SYMBOL_FILLING_IOC) != 0) {
-      obj_Trade.SetTypeFilling(ORDER_FILLING_IOC);
-   } else {
-      obj_Trade.SetTypeFilling(ORDER_FILLING_RETURN);
-   }
-   
-   Print("[INFO] Broker Settings Detected:");
-   Print("  Min Stop Level: ", minStopLevel, " points");
-   Print("  Lot Step: ", lotStep);
-   Print("  Lot Min: ", lotMin);
-}
-
-//+------------------------------------------------------------------+
-//| Print Configuration                                              |
-//+------------------------------------------------------------------+
-void PrintConfiguration() {
-   Print("═══════════════════════════════════════════════════════════");
-   Print("  CONFIGURATION");
-   Print("───────────────────────────────────────────────────────────");
-   Print("  Risk Per Trade   : ", RiskPercent, "%");
-   Print("  Max Daily Loss   : ", MaxDailyLossPct, "%");
-   Print("  Max Drawdown     : ", MaxDrawdownPct, "%");
-   Print("  Max Positions    : ", MaxPositions);
-   Print("  Lookback Candles : ", LookbackCandles);
-   Print("  Min Volume Ratio : ", MinVolumeRatio, "%");
-   Print("  Min Body %       : ", MinBodyPercent, "%");
-   Print("  Min ATR          : ", MinATR);
-   Print("  ATR Multiplier SL: ", ATRMultiplierSL);
-   Print("  ATR Multiplier TP: ", ATRMultiplierTP);
-   Print("  Cooldown Bars    : ", CooldownBars);
-   Print("  Max Holding Bars : ", MaxHoldingBars);
-   Print("═══════════════════════════════════════════════════════════");
 }
 
 //+------------------------------------------------------------------+
 //| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
-   PrintPerformance();
    Print("═══════════════════════════════════════════════════════════");
    Print("  EA Stopped - Reason: ", reason);
    Print("═══════════════════════════════════════════════════════════");
@@ -207,110 +131,61 @@ void OnDeinit(const int reason) {
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
-   obj_Symbol.Refresh();
-   
-   if (!IsNewBar()) return;
-   
    UpdateTracking();
    if (!PassesRiskChecks()) return;
-   UpdateIndicators();
    
-   int posCount = CountPositions();
-   if (posCount > 0) {
+   // Unlocked Position Management: Modifies open trades on every tick across all charts
+   if (CountPositions() > 0) {
       ManagePositions();
-      return;
    }
    
-   if (barsSinceLastTrade < CooldownBars) return;
-   
-   if (posCount < MaxPositions) {
-      CheckForEntry();
+   // Scan Top 20 Array independently
+   for (int i = 0; i < 20; i++) {
+      string sym = Top20CryptoSymbols[i];
+      
+      // Verify market watch access
+      if (!SymbolInfoInteger(sym, SYMBOL_SELECT)) continue; 
+      
+      if (!IsNewBar(sym, i)) continue;
+      if (barsSinceLastTrade[i] < CooldownBars) continue;
+      
+      if (CountPositions() < MaxPositions) {
+         CheckForEntry(sym, i);
+      }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Check if New Bar                                                 |
+//| Check if New Bar per Symbol                                      |
 //+------------------------------------------------------------------+
-bool IsNewBar() {
-   datetime currentBarTime = iTime(_Symbol, _Period, 0); // Dynamic chart timeframe
-   if (currentBarTime == lastBarTime) return false;
-   lastBarTime = currentBarTime;
-   barsSinceLastTrade++;
+bool IsNewBar(string sym, int index) {
+   datetime currentBarTime = (datetime)SeriesInfoInteger(sym, _Period, SERIES_LASTBAR_DATE);
+   if (currentBarTime == lastBarTime[index] || currentBarTime == 0) return false;
+   
+   lastBarTime[index] = currentBarTime;
+   barsSinceLastTrade[index]++;
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Update Tracking Variables                                        |
+//| Update Account Drawdown Limits                                   |
 //+------------------------------------------------------------------+
 void UpdateTracking() {
-   double currentBalance = obj_Account.Balance();
    double currentEquity = obj_Account.Equity();
-   
-   if (currentEquity > peakBalance) {
-      peakBalance = currentEquity;
-   }
+   if (currentEquity > peakBalance) peakBalance = currentEquity;
    
    dailyLoss = dailyStartBalance - currentEquity;
    currentDrawdown = ((peakBalance - currentEquity) / peakBalance) * 100;
 }
 
-//+------------------------------------------------------------------+
-//| Pass Risk Checks                                                 |
-//+------------------------------------------------------------------+
 bool PassesRiskChecks() {
    if ((dailyLoss / dailyStartBalance) * 100 >= MaxDailyLossPct) return false;
    if (currentDrawdown >= MaxDrawdownPct) return false;
-   
-   int spread = GetSpreadPoints();
-   if (spread > 10000) {
-      Print("[SKIP] Spread too high: ", spread, " points");
-      return false;
-   }
-   
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Update Indicators                                                |
-//+------------------------------------------------------------------+
-void UpdateIndicators() {
-   currentATR = CalculateATR(14);
-   avgVolume = CalculateAverageVolume(20);
-}
-
-//+------------------------------------------------------------------+
-//| Calculate ATR                                                    |
-//+------------------------------------------------------------------+
-double CalculateATR(int period) {
-   double atrArray[];
-   int atrHandle = iATR(_Symbol, _Period, period);
-   
-   if (CopyBuffer(atrHandle, 0, 0, 1, atrArray) <= 0) {
-      IndicatorRelease(atrHandle);
-      return 100;
-   }
-   
-   double atrPoints = atrArray[0] / _Point;
-   IndicatorRelease(atrHandle);
-   return (atrPoints > 0) ? atrPoints : 100;
-}
-
-//+------------------------------------------------------------------+
-//| Calculate Average Volume                                         |
-//+------------------------------------------------------------------+
-double CalculateAverageVolume(int period) {
-   long volumeArray[];
-   double total = 0;
-   if (CopyTickVolume(_Symbol, _Period, 1, period, volumeArray) <= 0) return 1;
-   
-   for (int i = 0; i < period; i++) {
-      total += volumeArray[i];
-   }
-   return (total / period);
-}
-
-//+------------------------------------------------------------------+
-//| Count Open Positions                                             |
+//| Count Open Positions Globally                                    |
 //+------------------------------------------------------------------+
 int CountPositions() {
    int count = 0;
@@ -325,39 +200,57 @@ int CountPositions() {
 }
 
 //+------------------------------------------------------------------+
-//| Get Spread in Points                                             |
+//| Indicators Calculation per Symbol                                |
 //+------------------------------------------------------------------+
-int GetSpreadPoints() {
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   return (int)((ask - bid) / _Point);
-}
-
-//+------------------------------------------------------------------+
-//| Check For Entry                                                  |
-//+------------------------------------------------------------------+
-void CheckForEntry() {
-   if (currentATR < MinATR) {
-      Print("[DEBUG] Skipping: ATR ", currentATR, " < MinATR ", MinATR);
-      return;
+double CalculateATR(string sym, int period) {
+   double atrArray[];
+   int atrHandle = iATR(sym, _Period, period);
+   
+   if (CopyBuffer(atrHandle, 0, 0, 1, atrArray) <= 0) {
+      IndicatorRelease(atrHandle);
+      return 0;
    }
    
-   int direction = DetectLiquiditySweep();
-   if (direction == 0) return;
+   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+   double atrPoints = (point > 0) ? atrArray[0] / point : 0;
    
-   EnterTrade(direction);
+   IndicatorRelease(atrHandle);
+   return atrPoints;
+}
+
+double CalculateAverageVolume(string sym, int period) {
+   long volumeArray[];
+   double total = 0;
+   if (CopyTickVolume(sym, _Period, 1, period, volumeArray) <= 0) return 1;
+   
+   for (int i = 0; i < period; i++) total += volumeArray[i];
+   return (total / period);
 }
 
 //+------------------------------------------------------------------+
-//| Detect Liquidity Sweep                                           |
+//| Check For Entry Trigger                                          |
 //+------------------------------------------------------------------+
-int DetectLiquiditySweep() {
+void CheckForEntry(string sym, int index) {
+   int spread = (int)((SymbolInfoDouble(sym, SYMBOL_ASK) - SymbolInfoDouble(sym, SYMBOL_BID)) / SymbolInfoDouble(sym, SYMBOL_POINT));
+   if (spread > 10000) return;
+   
+   double currentATR = CalculateATR(sym, 14);
+   if (currentATR < MinATR) return;
+   
+   double avgVolume = CalculateAverageVolume(sym, 20);
+   int direction = DetectLiquiditySweep(sym, avgVolume);
+   if (direction == 0) return;
+   
+   EnterTrade(sym, direction, currentATR, index);
+}
+
+//+------------------------------------------------------------------+
+//| Detect Liquidity Sweep Engine                                    |
+//+------------------------------------------------------------------+
+int DetectLiquiditySweep(string sym, double avgVol) {
    int direction = 0;
    
-   double highBuffer[];
-   double lowBuffer[];
-   double closeBuffer[];
-   double openBuffer[];
+   double highBuffer[], lowBuffer[], closeBuffer[], openBuffer[];
    long volumeBuffer[];
    
    int lookback = LookbackCandles;
@@ -367,11 +260,11 @@ int DetectLiquiditySweep() {
    ArraySetAsSeries(openBuffer, true);
    ArraySetAsSeries(volumeBuffer, true);
    
-   if (CopyHigh(_Symbol, _Period, 0, lookback + 2, highBuffer) < lookback + 2) return 0;
-   if (CopyLow(_Symbol, _Period, 0, lookback + 2, lowBuffer) < lookback + 2) return 0;
-   if (CopyClose(_Symbol, _Period, 0, lookback + 2, closeBuffer) < lookback + 2) return 0;
-   if (CopyOpen(_Symbol, _Period, 0, lookback + 2, openBuffer) < lookback + 2) return 0;
-   if (CopyTickVolume(_Symbol, _Period, 0, lookback + 2, volumeBuffer) < lookback + 2) return 0;
+   if (CopyHigh(sym, _Period, 0, lookback + 2, highBuffer) < lookback + 2) return 0;
+   if (CopyLow(sym, _Period, 0, lookback + 2, lowBuffer) < lookback + 2) return 0;
+   if (CopyClose(sym, _Period, 0, lookback + 2, closeBuffer) < lookback + 2) return 0;
+   if (CopyOpen(sym, _Period, 0, lookback + 2, openBuffer) < lookback + 2) return 0;
+   if (CopyTickVolume(sym, _Period, 0, lookback + 2, volumeBuffer) < lookback + 2) return 0;
    
    double swingHigh = highBuffer[ArrayMaximum(highBuffer, 2, lookback)];
    double swingLow = lowBuffer[ArrayMinimum(lowBuffer, 2, lookback)];
@@ -382,42 +275,23 @@ int DetectLiquiditySweep() {
    double currentOpen = openBuffer[1];
    long currentVolume = volumeBuffer[1];
    
-   //--- Sweep UP ---
    if (currentHigh > swingHigh && currentClose < swingHigh) {
       double bodyPercent = GetBodyPercent(currentOpen, currentClose, currentHigh, currentLow);
       if (bodyPercent >= MinBodyPercent) {
-         double reqVolume = avgVolume * MinVolumeRatio / 100.0;
-         if ((double)currentVolume >= reqVolume) {
-            direction = 1;  // SELL
-         } else {
-            Print("[DEBUG] Sweep UP: Vol ", currentVolume, " < Req ", reqVolume);
-         }
-      } else {
-         Print("[DEBUG] Sweep UP: Body ", DoubleToString(bodyPercent, 1), "% < Min ", MinBodyPercent, "%");
+         if ((double)currentVolume >= (avgVol * MinVolumeRatio / 100.0)) direction = 1;
       }
    }
    
-   //--- Sweep DOWN ---
    if (currentLow < swingLow && currentClose > swingLow) {
       double bodyPercent = GetBodyPercent(currentOpen, currentClose, currentHigh, currentLow);
       if (bodyPercent >= MinBodyPercent) {
-         double reqVolume = avgVolume * MinVolumeRatio / 100.0;
-         if ((double)currentVolume >= reqVolume) {
-            direction = -1;  // BUY
-         } else {
-            Print("[DEBUG] Sweep DOWN: Vol ", currentVolume, " < Req ", reqVolume);
-         }
-      } else {
-         Print("[DEBUG] Sweep DOWN: Body ", DoubleToString(bodyPercent, 1), "% < Min ", MinBodyPercent, "%");
+         if ((double)currentVolume >= (avgVol * MinVolumeRatio / 100.0)) direction = -1;
       }
    }
    
    return direction;
 }
 
-//+------------------------------------------------------------------+
-//| Get Body Percent of Candle                                       |
-//+------------------------------------------------------------------+
 double GetBodyPercent(double open, double close, double high, double low) {
    double range = high - low;
    if (range == 0) return 0;
@@ -426,77 +300,67 @@ double GetBodyPercent(double open, double close, double high, double low) {
 }
 
 //+------------------------------------------------------------------+
-//| Calculate Lot Size                                               |
+//| Trade Execution                                                  |
 //+------------------------------------------------------------------+
-double CalculateLotSize() {
-   double balance = obj_Account.Balance();
-   double riskAmount = balance * (RiskPercent / 100);
-   double stopLossPoints = currentATR * ATRMultiplierSL;
+void EnterTrade(string sym, int direction, double currentATR, int symIndex) {
+   double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(sym, SYMBOL_BID);
    
-   double tickValue = obj_Symbol.TickValue();
+   double minLevel = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
+   if (minLevel == 0) minLevel = 100;
+   
+   double lotStep = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   double lotMin = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   if(lotStep == 0) lotStep = 0.01;
+   if(lotMin == 0) lotMin = 0.01;
+   
+   double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
    if (tickValue <= 0) tickValue = 1.0;
-   if (stopLossPoints <= 0) stopLossPoints = 1.0;
-   
-   double lotSize = riskAmount / (stopLossPoints * tickValue);
-   
-   lotSize = MathRound(lotSize / lotStep) * lotStep;
-   if (lotSize < lotMin) lotSize = lotMin;
-   if (lotSize > SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX)) {
-      lotSize = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   }
-   
-   return lotSize;
-}
-
-//+------------------------------------------------------------------+
-//| Enter Trade                                                      |
-//+------------------------------------------------------------------+
-void EnterTrade(int direction) {
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double lotSize = CalculateLotSize();
    
    double slPoints = currentATR * ATRMultiplierSL;
    double tpPoints = currentATR * ATRMultiplierTP;
    
-   if (slPoints < minStopLevel) slPoints = minStopLevel;
-   if (tpPoints < minStopLevel * 2) tpPoints = minStopLevel * 2;
+   if (slPoints < minLevel) slPoints = minLevel;
+   if (tpPoints < minLevel * 2) tpPoints = minLevel * 2;
    
+   double riskAmount = obj_Account.Balance() * (RiskPercent / 100);
+   double pointSize = SymbolInfoDouble(sym, SYMBOL_POINT);
+   
+   double lotSize = riskAmount / (slPoints * tickValue);
+   lotSize = MathRound(lotSize / lotStep) * lotStep;
+   if (lotSize < lotMin) lotSize = lotMin;
+   
+   uint filling = (uint)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+   if((filling & SYMBOL_FILLING_FOK) != 0) obj_Trade.SetTypeFilling(ORDER_FILLING_FOK);
+   else if((filling & SYMBOL_FILLING_IOC) != 0) obj_Trade.SetTypeFilling(ORDER_FILLING_IOC);
+   else obj_Trade.SetTypeFilling(ORDER_FILLING_RETURN);
+
    bool success = false;
-   string comment = "";
+   string comment = (direction == 1) ? "Sweep_Up" : "Sweep_Down";
    
    for (int retry = 0; retry < OrderRetryCount; retry++) {
-      if (direction == 1) {  // SELL
-         double sl = bid + slPoints * _Point;
-         double tp = bid - tpPoints * _Point;
-         comment = "Sweep_Up_Rej";
-         success = obj_Trade.Sell(lotSize, _Symbol, bid, sl, tp, comment);
-      } else if (direction == -1) {  // BUY
-         double sl = ask - slPoints * _Point;
-         double tp = ask + tpPoints * _Point;
-         comment = "Sweep_Down_Rej";
-         success = obj_Trade.Buy(lotSize, _Symbol, ask, sl, tp, comment);
+      if (direction == 1) { 
+         success = obj_Trade.Sell(lotSize, sym, bid, bid + slPoints * pointSize, bid - tpPoints * pointSize, comment);
+      } else if (direction == -1) { 
+         success = obj_Trade.Buy(lotSize, sym, ask, ask - slPoints * pointSize, ask + tpPoints * pointSize, comment);
       }
       
       if (success) break;
-      
       Sleep(100);
-      obj_Symbol.Refresh();
-      ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+      bid = SymbolInfoDouble(sym, SYMBOL_BID);
    }
    
    if (success) {
       totalTradesToday++;
-      barsSinceLastTrade = 0;
-      Print("[✓] ORDER EXECUTED: ", comment, " | Lot: ", lotSize, " | SL: ", slPoints, " | TP: ", tpPoints);
-   } else {
-      Print("[ERROR] Order execution failed. Code: ", GetLastError());
+      totalTrades++;
+      barsSinceLastTrade[symIndex] = 0;
+      Print("[✓] EXECUTED on ", sym, " | Lot: ", lotSize);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Manage Positions                                                 |
+//| Dynamic Asset Position Management                                |
 //+------------------------------------------------------------------+
 void ManagePositions() {
    for (int i = PositionsTotal() - 1; i >= 0; i--) {
@@ -504,15 +368,20 @@ void ManagePositions() {
       if (PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
       
       ulong ticket = PositionGetTicket(i);
+      string posSym = PositionGetString(POSITION_SYMBOL);
+      
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double currentPrice = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) 
-                           ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
-                           : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                           ? SymbolInfoDouble(posSym, SYMBOL_BID)
+                           : SymbolInfoDouble(posSym, SYMBOL_ASK);
       
+      double currentATR = CalculateATR(posSym, 14);
       double slPoints = currentATR * ATRMultiplierSL;
+      double pointSize = SymbolInfoDouble(posSym, SYMBOL_POINT);
+      
       double rUnits = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-                     ? (currentPrice - openPrice) / (slPoints * _Point)
-                     : (openPrice - currentPrice) / (slPoints * _Point);
+                     ? (currentPrice - openPrice) / (slPoints * pointSize)
+                     : (openPrice - currentPrice) / (slPoints * pointSize);
       
       datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
       datetime currentTime = TimeCurrent();
@@ -524,7 +393,7 @@ void ManagePositions() {
       }
       
       if (rUnits >= TrailingStart) {
-         double trailStep = TrailingStep * slPoints * _Point;
+         double trailStep = TrailingStep * slPoints * pointSize;
          double newSL = 0;
          
          if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
@@ -542,9 +411,6 @@ void ManagePositions() {
    }
 }
 
-//+------------------------------------------------------------------+
-//| Close Position                                                   |
-//+------------------------------------------------------------------+
 void ClosePosition(ulong ticket, string reason) {
    if (obj_Trade.PositionClose(ticket)) {
       double profit = PositionGetDouble(POSITION_PROFIT);
@@ -559,26 +425,8 @@ void ClosePosition(ulong ticket, string reason) {
       Print("[X] CLOSED: ", reason, " | Profit: $", profit);
    }
 }
+//+------------------------------------------------------------------+
 
-//+------------------------------------------------------------------+
-//| Print Performance                                                |
-//+------------------------------------------------------------------+
-void PrintPerformance() {
-   double winRate = (totalTrades > 0) ? (double)winningTrades / totalTrades * 100 : 0;
-   Print("═══════════════════════════════════════════════════════════");
-   Print("  PERFORMANCE SUMMARY");
-   Print("───────────────────────────────────────────────────────────");
-   Print("  Total Trades    : ", totalTrades);
-   Print("  Winning Trades  : ", winningTrades);
-   Print("  Losing Trades   : ", losingTrades);
-   Print("  Win Rate        : ", winRate, "%");
-   Print("  Total Profit    : $", totalProfit);
-   Print("  Current Balance : $", obj_Account.Balance());
-   Print("  Daily Loss      : $", dailyLoss);
-   Print("  Drawdown        : ", currentDrawdown, "%");
-   Print("═══════════════════════════════════════════════════════════");
-}
-//+------------------------------------------------------------------+
 
 
 EOF
